@@ -1,0 +1,6 @@
+{"id":"arith-1","question":"A notebook costs $4. If Mei buys 3 notebooks, how much does she pay? Give the final answer in a boxed expression.","completion":"There are 3 groups of 4. \\boxed{12}"}
+{"id":"arith-1","question":"A notebook costs $4. If Mei buys 3 notebooks, how much does she pay? Give the final answer in a boxed expression.","completion":"Multiply 4 by 3. \\boxed{12}"}
+{"id":"arith-1","question":"A notebook costs $4. If Mei buys 3 notebooks, how much does she pay? Give the final answer in a boxed expression.","completion":"The total is \\boxed{13}"}
+{"id":"arith-2","question":"What is 12 times 13? Give the final answer in a boxed expression.","completion":"12 times 13 is 155. \\boxed{155}"}
+{"id":"arith-2","question":"What is 12 times 13? Give the final answer in a boxed expression.","completion":"Multiplication gives \\boxed{155}"}
+{"id":"arith-2","question":"What is 12 times 13? Give the final answer in a boxed expression.","completion":"The product is \\boxed{156}"}
