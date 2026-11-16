@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,6 +21,7 @@ class Candidate:
     id: str
     question: str
     completion: str
+    token_logprobs: tuple[float, ...] | None = None
 
 
 def _read_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -72,17 +74,34 @@ def load_candidates(path: str | Path) -> list[Candidate]:
         problem_id = record.get("id")
         question = record.get("question")
         completion = record.get("completion")
+        token_logprobs = record.get("token_logprobs")
         if not isinstance(problem_id, str) or not problem_id:
             raise ValueError(f"{source}:{line_number}: 'id' must be a non-empty string")
         if not isinstance(question, str) or not question.strip():
             raise ValueError(f"{source}:{line_number}: 'question' must be a non-empty string")
-        if not isinstance(completion, str) or not completion.strip():
-            raise ValueError(f"{source}:{line_number}: 'completion' must be a non-empty string")
+        if not isinstance(completion, str):
+            raise ValueError(f"{source}:{line_number}: 'completion' must be a string")
+        if token_logprobs is not None:
+            if not isinstance(token_logprobs, list) or any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                for value in token_logprobs
+            ):
+                raise ValueError(
+                    f"{source}:{line_number}: 'token_logprobs' must be a list "
+                    "of finite numbers"
+                )
         candidates.append(
             Candidate(
                 id=problem_id,
                 question=question.strip(),
                 completion=completion.strip(),
+                token_logprobs=(
+                    tuple(float(value) for value in token_logprobs)
+                    if token_logprobs is not None
+                    else None
+                ),
             )
         )
     return candidates
@@ -94,3 +113,36 @@ def write_jsonl(path: str | Path, records: Iterable[dict[str, Any]]) -> None:
     with target.open("w", encoding="utf-8", newline="\n") as output:
         for record in records:
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def prepare_gsm8k(split: str, output_path: str | Path) -> int:
+    if split not in {"train", "test"}:
+        raise ValueError("GSM8K split must be 'train' or 'test'")
+
+    try:
+        from datasets import load_dataset
+    except ImportError as error:
+        raise RuntimeError(
+            "GSM8K import dependencies are missing. Install "
+            '`python -m pip install -e ".[train]"`.'
+        ) from error
+
+    rows = load_dataset("openai/gsm8k", "main", split=split)
+    records = (
+        {
+            "id": f"{split}-{index:05d}",
+            "question": row["question"],
+            "answer": row["answer"],
+        }
+        for index, row in enumerate(rows)
+    )
+    count = 0
+
+    def counted_records() -> Iterable[dict[str, Any]]:
+        nonlocal count
+        for record in records:
+            count += 1
+            yield record
+
+    write_jsonl(output_path, counted_records())
+    return count

@@ -25,6 +25,19 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(result["selected_accuracy"], 0.5)
         self.assertEqual(result["selected_count"], 2)
 
+    def test_extracts_reference_from_gsm8k_rationale(self) -> None:
+        problems = [
+            Problem("gsm8k-1", "question", "Compute it.\n#### 1,200"),
+        ]
+        candidates = [
+            Candidate("gsm8k-1", "question", r"Work. \boxed{1200}"),
+        ]
+
+        result = evaluate(problems, candidates)
+
+        self.assertEqual(result["candidate_pass_at_k"], 1.0)
+        self.assertEqual(result["candidate_accuracy"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

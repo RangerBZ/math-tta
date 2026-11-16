@@ -1,14 +1,14 @@
 # Math TTA research prototype
 
-A lightweight prototype for sampling multiple mathematical reasoning
-trajectories, selecting pseudo-labels by answer agreement, and evaluating
-selection. The planned research experiments use Qwen3-0.6B and GSM8K; the
-current code is only the generation/selection/evaluation baseline.
+A lightweight prototype for iterative, outcome-verified self-training on
+mathematical reasoning. It can import GSM8K, sample model completions, verify
+their extracted answers against labeled references, and fine-tune on accepted
+traces using LoRA.
 
-> **Scope note:** This repository does not yet fine-tune the model or implement
-> an adaptive update algorithm. It does not download or preprocess GSM8K. See
-> the separate FYP workspace research report for the proposed method and
-> experiment design.
+> **Scope note:** This implements fixed-sample rejection-SFT as a baseline. It
+> does not yet implement adaptive sampling/weighting or RLVR/GRPO. Answer
+> verification checks only the final answer; it does not verify each reasoning
+> step.
 
 ## Environment setup
 
@@ -25,7 +25,7 @@ python -m venv .venv
 python -m pip install --upgrade pip
 # Install the matching PyTorch build: https://pytorch.org/get-started/locally/
 python -m pip install torch
-python -m pip install -e ".[model]"
+python -m pip install -e ".[train]"
 ```
 
 ### Linux / SSH server
@@ -37,7 +37,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 # Install the matching PyTorch build: https://pytorch.org/get-started/locally/
 python -m pip install torch
-python -m pip install -e ".[model]"
+python -m pip install -e ".[train]"
 ```
 
 Test the model-independent components without downloading any model:
@@ -46,10 +46,76 @@ Test the model-independent components without downloading any model:
 python -m unittest discover -s tests -v
 ```
 
-For Qwen3, Transformers 4.51.0 or later is required. A model download is
-triggered the first time the `generate` command is run. Check the model card
-and available hardware before starting generation:
+The `train` extra installs Transformers, PEFT, Accelerate, and Hugging Face
+Datasets. Install PyTorch separately using the command matching your CPU or
+CUDA hardware. A model/dataset download is triggered the first time the
+corresponding command is run. Check the model card and available hardware
+before training:
 [Qwen3-0.6B on Hugging Face](https://huggingface.co/Qwen/Qwen3-0.6B).
+
+## Prepare GSM8K
+
+Import the official training split to JSONL:
+
+```bash
+math-tta prepare-gsm8k --split train --output data/gsm8k_train.jsonl
+```
+
+Each record contains `id`, `question`, and the GSM8K `answer` rationale, whose
+final reference is extracted from its `####` marker. The test split can be
+exported for final evaluation, but **must not** be passed to `train`.
+
+## Run verified self-training
+
+Start with a small pilot to verify model loading, answer extraction, and
+hardware capacity:
+
+```bash
+math-tta train --input data/gsm8k_train.jsonl --output-dir outputs/qwen3-pilot --model Qwen/Qwen3-0.6B --samples 4 --limit-problems 128 --max-new-tokens 512 --rounds 1 --epochs 1 --batch-size 1 --max-length 2048 --seed 42
+```
+
+Omit `--limit-problems` to use the whole input file. Increase `--rounds` to
+regenerate from the updated model and continue LoRA training on newly verified
+traces. Training loads the base model in full precision unless CUDA supports
+BF16; this avoids silently choosing an unsupported reduced-precision mode.
+Reduce batch/context sizes if the available GPU memory is insufficient.
+
+The pipeline records, for each round:
+
+- `candidates-round-NN.jsonl`: generated completions without reference answers.
+- `verified-round-NN.jsonl`: extracted answers and verifier outcomes.
+- `accepted-round-NN.jsonl`: only traces with a correct final answer.
+- `metrics-round-NN.json`: parse rate, candidate accuracy, pass@k, and SFT loss.
+- `round-NN/adapter/` and `final-adapter/`: PEFT LoRA adapter and tokenizer.
+
+Unparseable generations count as failed attempts. Answer agreement does not
+decide which traces train the model: only the reference-answer verifier does.
+The saved adapter is PEFT-format and requires the original base model when
+loaded for inference.
+
+Evaluate the final adapter by generating from the base model with that adapter
+attached:
+
+```bash
+math-tta generate --input data/gsm8k_test.jsonl --output outputs/test_candidates.jsonl --model Qwen/Qwen3-0.6B --adapter outputs/qwen3-pilot/final-adapter --samples 8 --seed 42
+math-tta evaluate --problems data/gsm8k_test.jsonl --candidates outputs/test_candidates.jsonl
+```
+
+Keep the test answers out of training, checkpoint selection, and sampling-policy
+tuning; use them only for the final evaluation.
+
+To score previously generated candidates without training:
+
+```bash
+math-tta score --problems data/gsm8k_train.jsonl --candidates outputs/candidates.jsonl --output outputs/verified.jsonl
+```
+
+Sampled-token log-probabilities are optional because they require an additional
+forward pass for each completion. Enable `--record-token-logprobs` on
+`generate` or `train` to record the raw model log-probability for each sampled
+token (rather than the temperature/top-p-modified sampling distribution).
+Scoring reports the mean when these values are present; they are confidence
+diagnostics and do not affect answer verification or training selection.
 
 ## Run the bundled demonstration
 
@@ -66,8 +132,10 @@ The evaluation prints:
 ```json
 {
   "candidate_pass_at_k": 1.0,
+  "candidate_accuracy": 0.5,
   "labeled_problems": 2,
   "min_value": 0.5,
+  "parse_rate": 1.0,
   "problems_with_candidates": 2,
   "selected_accuracy": 0.5,
   "selected_count": 2,
@@ -114,15 +182,15 @@ math-tta evaluate --problems data/sample.jsonl --candidates outputs/candidates.j
 
 `--min-value` is the minimum winning-answer vote fraction. Selection also
 requires a unique majority; tied votes and groups without extractable final
-answers are not selected. The fixed seed helps reproduce sampling, but exact
-results may vary with hardware and software versions. Generation currently
-processes one problem at a time.
+answers are not selected. The fixed seed helps reproduce sampling, but exact results may vary with
+hardware and software versions. Increase `--batch-size` to batch prompts
+together when memory permits.
 
-## GSM8K experiment status
+## Research experiment cautions
 
-The commands above demonstrate only the current prototype. They do **not**
-train Qwen3, build GSM8K JSONL files, or implement the proposed adaptive
-sampling/weighting method. Do not evaluate a research result using the two
-bundled toy problems. For the intended experiment, prepare separate training,
-development, and held-out test data; use training answers only for training
-selection/scoring, and keep test answers out of all adaptation and tuning.
+For research results, keep separate training, development, and held-out test
+data. Use training answers for outcome verification and training only. Do not
+tune prompts, sampling policies, or checkpoints using the held-out test set.
+Match generation and training compute when comparing adaptive policies with
+fixed-sample rejection-SFT. The bundled toy problems are demonstrations, not
+evaluation data.
