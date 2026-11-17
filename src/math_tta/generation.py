@@ -64,7 +64,7 @@ def load_generation_model(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype="auto",
+        dtype="auto",
         device_map="auto",
     )
     if adapter_path is not None:

@@ -147,7 +147,8 @@ def _train_verified_examples(
     trained_examples = 0
     batches_per_epoch = len(loader)
 
-    for _ in range(epochs):
+    progress_interval = max(1, (batches_per_epoch + 19) // 20)
+    for epoch_index in range(1, epochs + 1):
         optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(loader):
             model_inputs = {key: value.to(device) for key, value in batch.items()}
@@ -177,6 +178,16 @@ def _train_verified_examples(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_steps += 1
+                if (
+                    optimizer_steps == 1
+                    or (batch_index + 1) % progress_interval == 0
+                    or batch_index + 1 == batches_per_epoch
+                ):
+                    print(
+                        f"SFT epoch {epoch_index}/{epochs}: "
+                        f"batch {batch_index + 1}/{batches_per_epoch}",
+                        flush=True,
+                    )
 
     model.config.use_cache = True
     if not losses:
@@ -252,17 +263,21 @@ def run_self_training(
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
         else torch.float32
     )
+    print(f"Loading tokenizer from {model_id}...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is None:
             raise ValueError("tokenizer must define a pad token or an eos token")
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    print(f"Loading model weights from {model_id}...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
     )
+    print(f"Moving model to {device}...", flush=True)
     model.to(device)
+    print("Attaching LoRA adapter...", flush=True)
     model = get_peft_model(
         model,
         LoraConfig(
@@ -294,6 +309,11 @@ def run_self_training(
 
         model.config.use_cache = True
         model.eval()
+        print(
+            f"{round_name}: generating {len(problems)} problems x {samples} "
+            f"samples (max_new_tokens={max_new_tokens})...",
+            flush=True,
+        )
         generated = iter(
             generate_candidate_batch(
                 problems,
@@ -312,7 +332,8 @@ def run_self_training(
             verified_path.open("w", encoding="utf-8") as verified_output,
             accepted_path.open("w", encoding="utf-8") as accepted_output,
         ):
-            for problem in problems:
+            progress_interval = max(1, (len(problems) + 19) // 20)
+            for problem_index, problem in enumerate(problems, start=1):
                 problem_candidates = list(islice(generated, samples))
                 if len(problem_candidates) != samples:
                     raise RuntimeError(
@@ -354,6 +375,19 @@ def run_self_training(
                     if scored.is_correct:
                         accepted.append(scored)
                         _write_record(accepted_output, scored.to_record())
+                if (
+                    problem_index == 1
+                    or problem_index % progress_interval == 0
+                    or problem_index == len(problems)
+                ):
+                    raw_output.flush()
+                    verified_output.flush()
+                    accepted_output.flush()
+                    print(
+                        f"{round_name}: generated {problem_index}/{len(problems)} "
+                        f"problems; {len(accepted)} verified traces accepted",
+                        flush=True,
+                    )
 
         metrics = verification_metrics(scored_for_metrics)
         if not accepted:
@@ -363,6 +397,10 @@ def run_self_training(
                 "fine-tuning update was performed."
             )
 
+        print(
+            f"{round_name}: fine-tuning on {len(accepted)} accepted traces...",
+            flush=True,
+        )
         training_metrics = _train_verified_examples(
             accepted,
             model,
@@ -382,6 +420,7 @@ def run_self_training(
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(checkpoint_dir)
         tokenizer.save_pretrained(checkpoint_dir)
+        print(f"{round_name}: saved adapter to {checkpoint_dir}", flush=True)
         summaries.append(metrics)
 
     final_adapter = output_root / "final-adapter"

@@ -99,7 +99,9 @@ Omit `--limit-problems` to use the whole input file. Increase `--rounds` to
 regenerate from the updated model and continue LoRA training on newly verified
 traces. Training loads the base model in full precision unless CUDA supports
 BF16; this avoids silently choosing an unsupported reduced-precision mode.
-Reduce batch/context sizes if the available GPU memory is insufficient.
+The CLI prints flushed progress during model loading, generation, and SFT, and
+flushes candidate artifacts periodically during generation. Reduce batch/context
+sizes if the available GPU memory is insufficient.
 
 The pipeline records, for each round:
 
