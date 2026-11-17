@@ -29,7 +29,7 @@ def _write_json(path: Path, record: dict[str, object]) -> None:
         output.write("\n")
 
 
-def _training_collator(tokenizer: Any, torch: Any) -> Any:
+def _training_collator(tokenizer: Any, torch: Any, max_length: int) -> Any:
     def collate(examples: list[VerifiedCandidate]) -> dict[str, Any]:
         tokenized = [
             item
@@ -96,9 +96,36 @@ def _train_verified_examples(
     ]
     skipped_examples = len(examples) - len(trainable_examples)
     if not trainable_examples:
+        oversized_lengths: list[int] = []
+        no_target_count = 0
+        for example in examples:
+            unbounded = tokenize_assistant_target(
+                tokenizer,
+                example.question,
+                example.completion,
+                max_length=2**63 - 1,
+            )
+            if unbounded is None:
+                no_target_count += 1
+            else:
+                oversized_lengths.append(len(unbounded[0]))
+
+        if oversized_lengths:
+            length_range = (
+                f"tokenized lengths {min(oversized_lengths)}"
+                f"-{max(oversized_lengths)}"
+            )
+        else:
+            length_range = "no tokenized assistant targets"
+        detail = (
+            f"{len(oversized_lengths)} exceed --max-length={max_length}; "
+            f"{no_target_count} contain no target tokens; {length_range}."
+        )
         raise ValueError(
-            "No accepted traces fit within --max-length; increase the limit "
-            "or reduce prompt/completion length."
+            "No accepted traces can be used for SFT: "
+            f"{detail} Check the tokenizer's chat template and completion "
+            "tokenization; increase --max-length only if the measured lengths "
+            "show traces are being truncated by the configured limit."
         )
 
     generator = torch.Generator()
@@ -108,7 +135,7 @@ def _train_verified_examples(
         batch_size=batch_size,
         shuffle=True,
         generator=generator,
-        collate_fn=_training_collator(tokenizer, torch),
+        collate_fn=_training_collator(tokenizer, torch, max_length),
     )
     model.config.use_cache = False
     model.train()
