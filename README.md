@@ -37,15 +37,22 @@ PyTorch as a dependency.
 
 ```bash
 cd /path/to/math-tta
+# If the shell prompt includes (.venv-math-tta), leave that venv first.
+deactivate
+
 # Activate the site-provided environment, for example:
 conda activate llm
 
-# Confirm this is the environment with the supported GPU build.
-python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+# Verify both Python and Torch come from the intended environment.
+python -c 'import sys, torch; print("Python:", sys.executable); print("Torch:", torch.__file__); print("Versions:", torch.__version__, torch.version.cuda); print("CUDA available:", torch.cuda.is_available())'
 
 # Install only the project and its Python training/data dependencies.
 python -m pip install -e ".[train]"
 ```
+
+Do not continue if the printed Python or Torch path contains
+`.venv-math-tta`. The installation command does not select or replace the
+PyTorch build; it uses whichever interpreter is active.
 
 The optional dependencies are constrained to Transformers 4.57.x and Datasets
 2.16-2.21 to avoid upgrading a VeOmni-managed Transformers/Datasets stack.
