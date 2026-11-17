@@ -54,8 +54,9 @@ Do not continue if the printed Python or Torch path contains
 `.venv-math-tta`. The installation command does not select or replace the
 PyTorch build; it uses whichever interpreter is active.
 
-The optional dependencies are constrained to Transformers 4.57.x and Datasets
-2.16-2.21 to avoid upgrading a VeOmni-managed Transformers/Datasets stack.
+The optional dependencies pin Transformers to 4.57.3 (VeOmni's exact
+requirement) and constrain Datasets to 2.16-2.21 to avoid incompatibilities
+with a VeOmni-managed stack.
 PyTorch 2.8.0+cu128 is compatible with the project's code and remains supplied
 by the existing environment; the install command above does not request a
 different PyTorch version. Avoid running `pip install torch` in this environment.
