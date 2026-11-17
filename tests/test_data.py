@@ -50,6 +50,7 @@ class DataTests(unittest.TestCase):
                         "question": "question",
                         "completion": "answer",
                         "completion_token_ids": [10, 11, 99],
+                        "prompt_token_ids": [1, 2, 3],
                     }
                 )
                 + "\n",
@@ -59,6 +60,7 @@ class DataTests(unittest.TestCase):
             candidates = load_candidates(path)
 
         self.assertEqual(candidates[0].completion_token_ids, (10, 11, 99))
+        self.assertEqual(candidates[0].prompt_token_ids, (1, 2, 3))
 
     def test_rejects_non_integer_completion_token_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

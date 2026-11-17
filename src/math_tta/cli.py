@@ -15,6 +15,7 @@ from math_tta.data import (
 )
 from math_tta.generation import generate_candidates
 from math_tta.metrics import evaluate
+from math_tta.rl_training import run_grpo_training
 from math_tta.selection import select_trajectories
 from math_tta.training import run_self_training
 from math_tta.verification import verify_candidates, verification_metrics
@@ -94,6 +95,12 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--lora-rank", type=int, default=8)
     train.add_argument("--lora-alpha", type=int, default=16)
     train.add_argument("--lora-dropout", type=float, default=0.05)
+    train.add_argument(
+        "--tune-mode",
+        choices=("lora", "full"),
+        default="lora",
+        help="update LoRA adapter parameters or all model parameters",
+    )
     train.add_argument("--seed", type=int, default=42)
     train.add_argument(
         "--record-token-logprobs",
@@ -101,6 +108,43 @@ def _parser() -> argparse.ArgumentParser:
         help="record raw-model log probabilities for sampled tokens",
     )
     train.add_argument(
+        "--limit-problems",
+        type=int,
+        help="optional pilot limit; problems are taken from the start of the file",
+    )
+
+    grpo = commands.add_parser(
+        "grpo",
+        help="sample grouped rollouts, verify outcomes, and update with clipped GRPO",
+    )
+    grpo.add_argument(
+        "--input",
+        required=True,
+        help="labeled training problem JSONL (do not use the test split)",
+    )
+    grpo.add_argument("--output-dir", required=True, help="rollouts and checkpoints")
+    grpo.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    grpo.add_argument("--samples", type=int, default=4)
+    grpo.add_argument("--generation-batch-size", type=int, default=1)
+    grpo.add_argument("--max-new-tokens", type=int, default=512)
+    grpo.add_argument("--rounds", type=int, default=1)
+    grpo.add_argument("--epochs", type=int, default=1)
+    grpo.add_argument("--batch-size", type=int, default=1)
+    grpo.add_argument("--max-length", type=int, default=2048)
+    grpo.add_argument("--learning-rate", type=float, default=1e-6)
+    grpo.add_argument("--clip-epsilon", type=float, default=0.2)
+    grpo.add_argument("--max-grad-norm", type=float, default=1.0)
+    grpo.add_argument("--lora-rank", type=int, default=8)
+    grpo.add_argument("--lora-alpha", type=int, default=16)
+    grpo.add_argument("--lora-dropout", type=float, default=0.05)
+    grpo.add_argument(
+        "--tune-mode",
+        choices=("lora", "full"),
+        default="lora",
+        help="update LoRA adapter parameters or all model parameters",
+    )
+    grpo.add_argument("--seed", type=int, default=42)
+    grpo.add_argument(
         "--limit-problems",
         type=int,
         help="optional pilot limit; problems are taken from the start of the file",
@@ -138,6 +182,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "completion_token_ids": (
                             list(candidate.completion_token_ids)
                             if candidate.completion_token_ids is not None
+                            else None
+                        ),
+                        "prompt_token_ids": (
+                            list(candidate.prompt_token_ids)
+                            if candidate.prompt_token_ids is not None
                             else None
                         ),
                         "sample_index": sample_index,
@@ -221,8 +270,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lora_rank=arguments.lora_rank,
                 lora_alpha=arguments.lora_alpha,
                 lora_dropout=arguments.lora_dropout,
+                tune_mode=arguments.tune_mode,
                 seed=arguments.seed,
                 record_token_logprobs=arguments.record_token_logprobs,
+            )
+            print(json.dumps(summaries, indent=2, sort_keys=True))
+            return 0
+
+        if arguments.command == "grpo":
+            problems = load_problems(arguments.input)
+            if arguments.limit_problems is not None:
+                if arguments.limit_problems < 1:
+                    raise ValueError("--limit-problems must be at least 1")
+                problems = problems[: arguments.limit_problems]
+            summaries = run_grpo_training(
+                problems,
+                model_id=arguments.model,
+                output_dir=arguments.output_dir,
+                samples=arguments.samples,
+                generation_batch_size=arguments.generation_batch_size,
+                max_new_tokens=arguments.max_new_tokens,
+                rounds=arguments.rounds,
+                epochs=arguments.epochs,
+                batch_size=arguments.batch_size,
+                max_length=arguments.max_length,
+                learning_rate=arguments.learning_rate,
+                clip_epsilon=arguments.clip_epsilon,
+                max_grad_norm=arguments.max_grad_norm,
+                lora_rank=arguments.lora_rank,
+                lora_alpha=arguments.lora_alpha,
+                lora_dropout=arguments.lora_dropout,
+                tune_mode=arguments.tune_mode,
+                seed=arguments.seed,
             )
             print(json.dumps(summaries, indent=2, sort_keys=True))
             return 0

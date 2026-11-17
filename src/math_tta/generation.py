@@ -15,6 +15,7 @@ def _validate_generation_options(
     temperature: float,
     top_p: float,
     batch_size: int,
+    top_k: int | None = None,
 ) -> None:
     if samples < 1:
         raise ValueError("samples must be at least 1")
@@ -26,6 +27,8 @@ def _validate_generation_options(
         raise ValueError("top_p must be in the interval (0, 1]")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    if top_k is not None and top_k < 0:
+        raise ValueError("top_k must be non-negative")
 
 
 def set_seed(seed: int) -> None:
@@ -89,14 +92,15 @@ def _raw_token_logprobs(
     torch: Any,
 ) -> tuple[float, ...]:
     generated_ids = sequence[prompt_width:]
+    eos_index: int | None = None
     if tokenizer.eos_token_id is not None:
         eos_positions = (generated_ids == tokenizer.eos_token_id).nonzero(
             as_tuple=True
         )[0]
-    else:
-        eos_positions = ()
-    if len(eos_positions):
-        generated_length = int(eos_positions[0]) + 1
+        if len(eos_positions):
+            eos_index = int(eos_positions[0])
+    if eos_index is not None:
+        generated_length = eos_index + 1
     else:
         generated_length = generated_ids.numel()
     if generated_length == 0:
@@ -161,6 +165,7 @@ def generate_candidate_batch(
     top_p: float = 0.95,
     batch_size: int = 1,
     record_token_logprobs: bool = False,
+    top_k: int | None = None,
 ) -> Iterator[Candidate]:
     _validate_generation_options(
         samples,
@@ -168,6 +173,7 @@ def generate_candidate_batch(
         temperature,
         top_p,
         batch_size,
+        top_k,
     )
     problem_list = list(problems)
     for start in range(0, len(problem_list), batch_size):
@@ -188,19 +194,30 @@ def generate_candidate_batch(
         import torch
 
         with torch.inference_mode():
+            generation_options: dict[str, Any] = {
+                "do_sample": True,
+                "num_return_sequences": samples,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_new_tokens": max_new_tokens,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+            if top_k is not None:
+                generation_options["top_k"] = top_k
             output = model.generate(
                 **encoded,
-                do_sample=True,
-                num_return_sequences=samples,
-                temperature=temperature,
-                top_p=top_p,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                **generation_options,
             )
 
         for problem_index, problem in enumerate(batch):
             first_sequence = problem_index * samples
+            prompt_token_ids = tuple(
+                int(token_id)
+                for token_id in encoded["input_ids"][problem_index][
+                    encoded["attention_mask"][problem_index].bool()
+                ].tolist()
+            )
             for sequence in output[first_sequence : first_sequence + samples]:
                 generated_ids = sequence[prompt_width:]
                 if tokenizer.eos_token_id is not None:
@@ -208,7 +225,8 @@ def generate_candidate_batch(
                         as_tuple=True
                     )[0]
                     if len(eos_positions):
-                        generated_ids = generated_ids[: int(eos_positions[0]) + 1]
+                        eos_index = int(eos_positions[0])
+                        generated_ids = generated_ids[: eos_index + 1]
                 completion = tokenizer.decode(
                     generated_ids,
                     skip_special_tokens=True,
@@ -233,6 +251,7 @@ def generate_candidate_batch(
                     completion_token_ids=tuple(
                         int(token_id) for token_id in generated_ids.tolist()
                     ),
+                    prompt_token_ids=prompt_token_ids,
                 )
 
 
@@ -247,6 +266,7 @@ def generate_candidates(
     batch_size: int = 1,
     record_token_logprobs: bool = False,
     adapter_path: str | None = None,
+    top_k: int | None = None,
 ) -> Iterator[Candidate]:
     _validate_generation_options(
         samples,
@@ -254,6 +274,7 @@ def generate_candidates(
         temperature,
         top_p,
         batch_size,
+        top_k,
     )
     set_seed(seed)
     tokenizer, model = load_generation_model(model_id, adapter_path)
@@ -267,4 +288,5 @@ def generate_candidates(
         top_p=top_p,
         batch_size=batch_size,
         record_token_logprobs=record_token_logprobs,
+        top_k=top_k,
     )

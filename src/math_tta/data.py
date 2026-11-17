@@ -23,6 +23,15 @@ class Candidate:
     completion: str
     token_logprobs: tuple[float, ...] | None = None
     completion_token_ids: tuple[int, ...] | None = None
+    prompt_token_ids: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
+class Rollout:
+    candidate: Candidate
+    reward: float
+    old_policy_logprobs: tuple[float, ...]
+    advantage: float
 
 
 def _read_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -77,6 +86,7 @@ def load_candidates(path: str | Path) -> list[Candidate]:
         completion = record.get("completion")
         token_logprobs = record.get("token_logprobs")
         completion_token_ids = record.get("completion_token_ids")
+        prompt_token_ids = record.get("prompt_token_ids")
         if not isinstance(problem_id, str) or not problem_id:
             raise ValueError(f"{source}:{line_number}: 'id' must be a non-empty string")
         if not isinstance(question, str) or not question.strip():
@@ -103,6 +113,15 @@ def load_candidates(path: str | Path) -> list[Candidate]:
                     f"{source}:{line_number}: 'completion_token_ids' must be "
                     "a list of integers"
                 )
+        if prompt_token_ids is not None:
+            if not isinstance(prompt_token_ids, list) or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in prompt_token_ids
+            ):
+                raise ValueError(
+                    f"{source}:{line_number}: 'prompt_token_ids' must be "
+                    "a list of integers"
+                )
         candidates.append(
             Candidate(
                 id=problem_id,
@@ -116,6 +135,11 @@ def load_candidates(path: str | Path) -> list[Candidate]:
                 completion_token_ids=(
                     tuple(completion_token_ids)
                     if completion_token_ids is not None
+                    else None
+                ),
+                prompt_token_ids=(
+                    tuple(prompt_token_ids)
+                    if prompt_token_ids is not None
                     else None
                 ),
             )

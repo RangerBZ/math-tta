@@ -1,16 +1,21 @@
-"""Outcome-verified iterative self-training with parameter-efficient SFT."""
+"""Outcome-verified iterative self-training with supervised fine-tuning."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from collections.abc import Sequence
 from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from math_tta.data import Problem
 from math_tta.generation import generate_candidate_batch, set_seed
+from math_tta.model_training import (
+    TuneMode,
+    load_trainable_model,
+    save_training_checkpoint,
+)
 from math_tta.prompts import tokenize_assistant_target
 from math_tta.verification import (
     VerifiedCandidate,
@@ -23,9 +28,9 @@ def _write_record(output: Any, record: dict[str, object]) -> None:
     output.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def _write_json(path: Path, record: dict[str, object]) -> None:
+def _write_json(path: Path, record: Mapping[str, object]) -> None:
     with path.open("w", encoding="utf-8") as output:
-        json.dump(record, output, ensure_ascii=False, indent=2)
+        json.dump(dict(record), output, ensure_ascii=False, indent=2)
         output.write("\n")
 
 
@@ -224,9 +229,10 @@ def run_self_training(
     lora_rank: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
+    tune_mode: TuneMode = "lora",
     seed: int = 42,
     record_token_logprobs: bool = False,
-) -> list[dict[str, float | int | None]]:
+) -> list[dict[str, object]]:
     if not problems:
         raise ValueError("training requires at least one problem")
     if len({problem.id for problem in problems}) != len(problems):
@@ -245,50 +251,17 @@ def run_self_training(
         raise ValueError("learning_rate, lora_rank, and lora_alpha must be positive")
     if not 0.0 <= lora_dropout < 1.0:
         raise ValueError("lora_dropout must be in the interval [0, 1)")
-
-    try:
-        import torch
-        from peft import LoraConfig, TaskType, get_peft_model
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as error:
-        raise RuntimeError(
-            "Training dependencies are missing. Install the matching PyTorch "
-            "build and run `python -m pip install -e \".[train]\"`."
-        ) from error
+    if tune_mode not in {"lora", "full"}:
+        raise ValueError("--tune-mode must be 'lora' or 'full'")
 
     set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_dtype = (
-        torch.bfloat16
-        if device.type == "cuda" and torch.cuda.is_bf16_supported()
-        else torch.float32
-    )
-    print(f"Loading tokenizer from {model_id}...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is None:
-            raise ValueError("tokenizer must define a pad token or an eos token")
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    print(f"Loading model weights from {model_id}...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    torch, tokenizer, model, device = load_trainable_model(
         model_id,
-        dtype=model_dtype,
+        tune_mode=tune_mode,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
     )
-    print(f"Moving model to {device}...", flush=True)
-    model.to(device)
-    print("Attaching LoRA adapter...", flush=True)
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        ),
-    )
-    model.config.pad_token_id = tokenizer.pad_token_id
     trainable_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
@@ -296,7 +269,7 @@ def run_self_training(
 
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
-    summaries: list[dict[str, float | int | None]] = []
+    summaries: list[dict[str, object]] = []
 
     for round_index in range(1, rounds + 1):
         round_name = f"round-{round_index:02d}"
@@ -356,6 +329,11 @@ def run_self_training(
                                 if candidate.completion_token_ids is not None
                                 else None
                             ),
+                            "prompt_token_ids": (
+                                list(candidate.prompt_token_ids)
+                                if candidate.prompt_token_ids is not None
+                                else None
+                            ),
                             "sample_index": sample_index,
                             "round": round_index,
                             "model": model_id,
@@ -389,7 +367,9 @@ def run_self_training(
                         flush=True,
                     )
 
-        metrics = verification_metrics(scored_for_metrics)
+        metrics: dict[str, object] = {
+            **verification_metrics(scored_for_metrics),
+        }
         if not accepted:
             _write_json(metrics_path, metrics)
             raise RuntimeError(
@@ -416,20 +396,21 @@ def run_self_training(
         )
         metrics.update(training_metrics)
         _write_json(metrics_path, metrics)
-        checkpoint_dir = output_root / round_name / "adapter"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(checkpoint_dir)
-        tokenizer.save_pretrained(checkpoint_dir)
-        print(f"{round_name}: saved adapter to {checkpoint_dir}", flush=True)
+        checkpoint_kind = "adapter" if tune_mode == "lora" else "model"
+        checkpoint_dir = output_root / round_name / checkpoint_kind
+        save_training_checkpoint(model, tokenizer, checkpoint_dir)
+        print(f"{round_name}: saved checkpoint to {checkpoint_dir}", flush=True)
         summaries.append(metrics)
 
-    final_adapter = output_root / "final-adapter"
-    model.save_pretrained(final_adapter)
-    tokenizer.save_pretrained(final_adapter)
+    final_checkpoint = output_root / (
+        "final-adapter" if tune_mode == "lora" else "final-model"
+    )
+    save_training_checkpoint(model, tokenizer, final_checkpoint)
     _write_json(
         output_root / "training-summary.json",
         {
             "model": model_id,
+            "tune_mode": tune_mode,
             "seed": seed,
             "samples_per_problem": samples,
             "generation_batch_size": generation_batch_size,
@@ -445,7 +426,10 @@ def run_self_training(
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
             "rounds": len(summaries),
-            "final_adapter": str(final_adapter),
+            "final_adapter": (
+                str(final_checkpoint) if tune_mode == "lora" else None
+            ),
+            "final_checkpoint": str(final_checkpoint),
             "round_metrics": summaries,
         },
     )

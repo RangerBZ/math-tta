@@ -112,6 +112,44 @@ The pipeline records, for each round:
 - `metrics-round-NN.json`: parse rate, candidate accuracy, pass@k, and SFT loss.
 - `round-NN/adapter/` and `final-adapter/`: PEFT LoRA adapter and tokenizer.
 
+Use `--tune-mode full` to update all model parameters instead. Full checkpoints
+are written under `round-NN/model/` and `final-model/`; this uses substantially
+more GPU memory than the default LoRA mode.
+
+## Run clipped GRPO
+
+The `grpo` command uses the same labeled JSONL input and answer verifier, but
+keeps both correct and incorrect sampled rollouts. It normalizes binary rewards
+within each question's sample group and optimizes a clipped policy-ratio
+objective. Sampling uses temperature 1, top-p 1, and top-k disabled so the
+stored old-policy token probabilities match the sampling policy.
+
+```bash
+math-tta grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-grpo-pilot \
+  --model Qwen/Qwen3-0.6B \
+  --samples 4 \
+  --limit-problems 128 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
+
+GRPO has no learned value critic. Groups in which every sample has the same
+reward have zero group-relative advantage; the run reports and skips the update
+if no group has mixed rewards. This initial implementation uses policy-ratio
+clipping and gradient-norm clipping, but does not yet include a reference-policy
+KL penalty, PPO's value critic/clipping, OPSD, or SDPO. It saves
+`rollouts-round-NN.jsonl` with rewards, advantages, and old-policy token
+log-probabilities, alongside verifier metrics and per-round checkpoints.
+
 Unparseable generations count as failed attempts. Answer agreement does not
 decide which traces train the model: only the reference-answer verifier does.
 The saved adapter is PEFT-format and requires the original base model when
