@@ -28,17 +28,30 @@ python -m pip install torch
 python -m pip install -e ".[train]"
 ```
 
-### Linux / SSH server
+### Linux / SSH server using an existing CUDA environment
+
+If your server provides a managed conda environment with a working PyTorch
+CUDA build, use that environment directly. Do **not** create a separate venv
+or install/upgrade PyTorch inside it. The project intentionally does not list
+PyTorch as a dependency.
 
 ```bash
 cd /path/to/math-tta
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-# Install the matching PyTorch build: https://pytorch.org/get-started/locally/
-python -m pip install torch
+# Activate the site-provided environment, for example:
+conda activate llm
+
+# Confirm this is the environment with the supported GPU build.
+python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+
+# Install only the project and its Python training/data dependencies.
 python -m pip install -e ".[train]"
 ```
+
+The optional dependencies are constrained to Transformers 4.57.x and Datasets
+2.16-2.21 to avoid upgrading a VeOmni-managed Transformers/Datasets stack.
+PyTorch 2.8.0+cu128 is compatible with the project's code and remains supplied
+by the existing environment; the install command above does not request a
+different PyTorch version. Avoid running `pip install torch` in this environment.
 
 Test the model-independent components without downloading any model:
 
