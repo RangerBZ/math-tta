@@ -28,38 +28,30 @@ def tokenize_assistant_target(
     question: str,
     completion: str,
     max_length: int,
+    completion_token_ids: tuple[int, ...] | list[int] | None = None,
 ) -> tuple[list[int], list[int]] | None:
-    messages = [
-        {"role": "user", "content": user_message(question)},
-        {"role": "assistant", "content": completion},
-    ]
-    if getattr(tokenizer, "chat_template", None):
-        prompt_ids = tokenizer.apply_chat_template(
-            messages[:1],
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        input_ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-        )
+    has_chat_template = bool(getattr(tokenizer, "chat_template", None))
+    prompt = format_generation_prompt(tokenizer, question)
+    prompt_ids = list(
+        tokenizer(
+            prompt,
+            add_special_tokens=not has_chat_template,
+        )["input_ids"]
+    )
+    if completion_token_ids is not None:
+        target_ids = list(completion_token_ids)
     else:
-        prompt_text = user_message(question) + "\n"
-        target_text = completion
-        if tokenizer.eos_token:
-            target_text += tokenizer.eos_token
-        prompt_ids = tokenizer(prompt_text, add_special_tokens=True)["input_ids"]
-        target_ids = tokenizer(target_text, add_special_tokens=False)["input_ids"]
-        input_ids = list(prompt_ids) + list(target_ids)
-
-    prompt_ids = list(prompt_ids)
-    input_ids = list(input_ids)
-    prompt_length = len(prompt_ids)
-    if input_ids[:prompt_length] != prompt_ids:
-        raise ValueError(
-            "chat template training sequence does not begin with its generation prompt"
+        target_ids = list(
+            tokenizer(completion, add_special_tokens=False)["input_ids"]
         )
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None and (
+            not target_ids or target_ids[-1] != eos_token_id
+        ):
+            target_ids.append(eos_token_id)
+
+    input_ids = prompt_ids + target_ids
+    prompt_length = len(prompt_ids)
     if len(input_ids) > max_length:
         return None
     if prompt_length >= len(input_ids):

@@ -20,6 +20,27 @@ class BasicTokenizer:
         }
 
 
+class ChatTemplateTokenizer:
+    chat_template = "fake-template"
+    eos_token = "<eos>"
+    eos_token_id = 99
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    ):
+        if tokenize:
+            return [10, 11]
+        return "formatted-generation-prompt"
+
+    def __call__(self, text, add_special_tokens=True):
+        if text == "formatted-generation-prompt":
+            return {"input_ids": [10, 11]}
+        raise AssertionError("prompt tokenization should use the generation prefix")
+
+
 class PromptTests(unittest.TestCase):
     def test_masks_prompt_tokens_and_trains_on_assistant_target(self) -> None:
         tokenizer = BasicTokenizer()
@@ -52,6 +73,17 @@ class PromptTests(unittest.TestCase):
                 max_length=2,
             )
         )
+
+    def test_uses_exact_generated_ids_after_chat_generation_prefix(self) -> None:
+        result = tokenize_assistant_target(
+            ChatTemplateTokenizer(),
+            "question",
+            "decoded text may not retain special tokens",
+            max_length=10,
+            completion_token_ids=(20, 21, 99),
+        )
+
+        self.assertEqual(result, ([10, 11, 20, 21, 99], [-100, -100, 20, 21, 99]))
 
 
 if __name__ == "__main__":

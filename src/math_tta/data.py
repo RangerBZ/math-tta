@@ -22,6 +22,7 @@ class Candidate:
     question: str
     completion: str
     token_logprobs: tuple[float, ...] | None = None
+    completion_token_ids: tuple[int, ...] | None = None
 
 
 def _read_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -75,6 +76,7 @@ def load_candidates(path: str | Path) -> list[Candidate]:
         question = record.get("question")
         completion = record.get("completion")
         token_logprobs = record.get("token_logprobs")
+        completion_token_ids = record.get("completion_token_ids")
         if not isinstance(problem_id, str) or not problem_id:
             raise ValueError(f"{source}:{line_number}: 'id' must be a non-empty string")
         if not isinstance(question, str) or not question.strip():
@@ -92,6 +94,15 @@ def load_candidates(path: str | Path) -> list[Candidate]:
                     f"{source}:{line_number}: 'token_logprobs' must be a list "
                     "of finite numbers"
                 )
+        if completion_token_ids is not None:
+            if not isinstance(completion_token_ids, list) or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in completion_token_ids
+            ):
+                raise ValueError(
+                    f"{source}:{line_number}: 'completion_token_ids' must be "
+                    "a list of integers"
+                )
         candidates.append(
             Candidate(
                 id=problem_id,
@@ -100,6 +111,11 @@ def load_candidates(path: str | Path) -> list[Candidate]:
                 token_logprobs=(
                     tuple(float(value) for value in token_logprobs)
                     if token_logprobs is not None
+                    else None
+                ),
+                completion_token_ids=(
+                    tuple(completion_token_ids)
+                    if completion_token_ids is not None
                     else None
                 ),
             )

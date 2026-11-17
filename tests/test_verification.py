@@ -43,6 +43,7 @@ class VerificationTests(unittest.TestCase):
                     "question",
                     r"\boxed{7}",
                     token_logprobs=(-0.5, -1.5),
+                    completion_token_ids=(10, 11),
                 )
             ],
         )
@@ -51,6 +52,7 @@ class VerificationTests(unittest.TestCase):
 
         self.assertEqual(metrics["candidates_with_token_logprobs"], 1)
         self.assertEqual(metrics["mean_sampled_token_logprob"], -1.0)
+        self.assertEqual(verified[0].completion_token_ids, (10, 11))
 
     def test_rejects_missing_or_mismatched_training_reference(self) -> None:
         with self.assertRaisesRegex(ValueError, "no reference answer"):

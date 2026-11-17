@@ -19,6 +19,7 @@ class VerifiedCandidate:
     predicted_answer: str | None
     is_correct: bool
     token_logprobs: tuple[float, ...] | None = None
+    completion_token_ids: tuple[int, ...] | None = None
 
     @property
     def is_parseable(self) -> bool:
@@ -73,6 +74,7 @@ def verify_candidates(
                 predicted_answer=predicted_answer,
                 is_correct=is_correct,
                 token_logprobs=candidate.token_logprobs,
+                completion_token_ids=candidate.completion_token_ids,
             )
         )
     return verified

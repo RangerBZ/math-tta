@@ -40,6 +40,7 @@ def _training_collator(tokenizer: Any, torch: Any, max_length: int) -> Any:
                     example.question,
                     example.completion,
                     max_length,
+                    completion_token_ids=example.completion_token_ids,
                 )
             )
             is not None
@@ -91,6 +92,7 @@ def _train_verified_examples(
             example.question,
             example.completion,
             max_length,
+            completion_token_ids=example.completion_token_ids,
         )
         is not None
     ]
@@ -104,6 +106,7 @@ def _train_verified_examples(
                 example.question,
                 example.completion,
                 max_length=2**63 - 1,
+                completion_token_ids=example.completion_token_ids,
             )
             if unbounded is None:
                 no_target_count += 1
@@ -327,6 +330,11 @@ def run_self_training(
                             "id": candidate.id,
                             "question": candidate.question,
                             "completion": candidate.completion,
+                            "completion_token_ids": (
+                                list(candidate.completion_token_ids)
+                                if candidate.completion_token_ids is not None
+                                else None
+                            ),
                             "sample_index": sample_index,
                             "round": round_index,
                             "model": model_id,

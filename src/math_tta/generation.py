@@ -202,8 +202,15 @@ def generate_candidate_batch(
         for problem_index, problem in enumerate(batch):
             first_sequence = problem_index * samples
             for sequence in output[first_sequence : first_sequence + samples]:
+                generated_ids = sequence[prompt_width:]
+                if tokenizer.eos_token_id is not None:
+                    eos_positions = (generated_ids == tokenizer.eos_token_id).nonzero(
+                        as_tuple=True
+                    )[0]
+                    if len(eos_positions):
+                        generated_ids = generated_ids[: int(eos_positions[0]) + 1]
                 completion = tokenizer.decode(
-                    sequence[prompt_width:],
+                    generated_ids,
                     skip_special_tokens=True,
                 ).strip()
                 token_logprobs = (
@@ -223,6 +230,9 @@ def generate_candidate_batch(
                     question=problem.question,
                     completion=completion,
                     token_logprobs=token_logprobs,
+                    completion_token_ids=tuple(
+                        int(token_id) for token_id in generated_ids.tolist()
+                    ),
                 )
 
 

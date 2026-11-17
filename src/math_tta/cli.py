@@ -135,6 +135,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "id": candidate.id,
                         "question": candidate.question,
                         "completion": candidate.completion,
+                        "completion_token_ids": (
+                            list(candidate.completion_token_ids)
+                            if candidate.completion_token_ids is not None
+                            else None
+                        ),
                         "sample_index": sample_index,
                         "model": arguments.model,
                         "adapter": arguments.adapter,

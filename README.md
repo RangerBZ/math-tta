@@ -82,7 +82,8 @@ Reduce batch/context sizes if the available GPU memory is insufficient.
 
 The pipeline records, for each round:
 
-- `candidates-round-NN.jsonl`: generated completions without reference answers.
+- `candidates-round-NN.jsonl`: generated completions and the exact generated
+  token IDs, without reference answers.
 - `verified-round-NN.jsonl`: extracted answers and verifier outcomes.
 - `accepted-round-NN.jsonl`: only traces with a correct final answer.
 - `metrics-round-NN.json`: parse rate, candidate accuracy, pass@k, and SFT loss.
@@ -110,12 +111,17 @@ To score previously generated candidates without training:
 math-tta score --problems data/gsm8k_train.jsonl --candidates outputs/candidates.jsonl --output outputs/verified.jsonl
 ```
 
-Sampled-token log-probabilities are optional because they require an additional
-forward pass for each completion. Enable `--record-token-logprobs` on
-`generate` or `train` to record the raw model log-probability for each sampled
-token (rather than the temperature/top-p-modified sampling distribution).
-Scoring reports the mean when these values are present; they are confidence
-diagnostics and do not affect answer verification or training selection.
+SFT uses the exact sampled token IDs after the same prompt prefix used during
+generation. This avoids reconstructing model-specific chat-template tokens
+from decoded completion text. If an earlier run failed with “no tokenized
+assistant targets,” rerun it with this version: the old candidate artifacts
+did not include these token IDs. Sampled-token log-probabilities are optional
+because they require an additional forward pass for each completion. Enable
+`--record-token-logprobs` on `generate` or `train` to record the raw model
+log-probability for each sampled token (rather than the
+temperature/top-p-modified sampling distribution). Scoring reports the mean
+when these values are present; they are confidence diagnostics and do not
+affect answer verification or training selection.
 
 ## Run the bundled demonstration
 

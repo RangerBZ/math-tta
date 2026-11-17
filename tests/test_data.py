@@ -40,6 +40,50 @@ class DataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "finite numbers"):
                 load_candidates(path)
 
+    def test_loads_exact_completion_token_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidates.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "id": "p1",
+                        "question": "question",
+                        "completion": "answer",
+                        "completion_token_ids": [10, 11, 99],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            candidates = load_candidates(path)
+
+        self.assertEqual(candidates[0].completion_token_ids, (10, 11, 99))
+
+    def test_rejects_non_integer_completion_token_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidates.jsonl"
+            path.write_text(
+                '{"id":"p1","question":"q","completion":"x",'
+                '"completion_token_ids":[10.5]}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "list of integers"):
+                load_candidates(path)
+
+    def test_rejects_boolean_completion_token_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidates.jsonl"
+            path.write_text(
+                '{"id":"p1","question":"q","completion":"x",'
+                '"completion_token_ids":[true]}\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "list of integers"):
+                load_candidates(path)
+
 
 if __name__ == "__main__":
     unittest.main()
