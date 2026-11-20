@@ -149,6 +149,32 @@ clipping and gradient-norm clipping, but does not yet include a reference-policy
 KL penalty, PPO's value critic/clipping, OPSD, or SDPO. It saves
 `rollouts-round-NN.jsonl` with rewards, advantages, and old-policy token
 log-probabilities, alongside verifier metrics and per-round checkpoints.
+Sampling defaults to one GPU. Set `--sampling-devices 2` to replicate the model
+across two visible CUDA GPUs and distribute question rollouts between them;
+scoring and GRPO updates remain on the primary GPU. The generation batch size
+applies independently to each replica.
+
+For a two-H200 server, start with `--sampling-devices 2` and
+`--generation-batch-size 1`; this parallelizes rollout generation, not training:
+
+```bash
+math-tta grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-grpo-h200 \
+  --model Qwen/Qwen3-0.6B \
+  --samples 4 \
+  --sampling-devices 2 \
+  --generation-batch-size 1 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
 
 ### Majority pseudo-label reward mode
 

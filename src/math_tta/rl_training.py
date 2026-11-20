@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from itertools import islice
@@ -21,6 +23,57 @@ from math_tta.model_training import (
 from math_tta.verification import verify_candidates, verification_metrics
 
 RewardMode = Literal["verifier", "pseudo-label"]
+
+
+def _partition_problems(
+    problems: Sequence[Problem],
+    worker_count: int,
+) -> list[list[tuple[int, Problem]]]:
+    if worker_count < 1:
+        raise ValueError("worker_count must be positive")
+    shards: list[list[tuple[int, Problem]]] = [
+        [] for _ in range(min(worker_count, len(problems)))
+    ]
+    for index, problem in enumerate(problems):
+        shards[index % len(shards)].append((index, problem))
+    return shards
+
+
+def _generate_problem_shard(
+    indexed_problems: Sequence[tuple[int, Problem]],
+    model: Any,
+    tokenizer: Any,
+    *,
+    samples: int,
+    max_new_tokens: int,
+    generation_batch_size: int,
+    progress_bar: Any,
+) -> list[tuple[int, list[Candidate]]]:
+    problems = [problem for _, problem in indexed_problems]
+    generated = iter(
+        generate_candidate_batch(
+            problems,
+            model,
+            tokenizer,
+            samples=samples,
+            max_new_tokens=max_new_tokens,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0,
+            batch_size=generation_batch_size,
+        )
+    )
+    indexed_groups: list[tuple[int, list[Candidate]]] = []
+    for index, problem in indexed_problems:
+        candidates = list(islice(generated, samples))
+        if len(candidates) != samples:
+            raise RuntimeError(
+                f"generation returned fewer than {samples} samples "
+                f"for problem {problem.id!r}"
+            )
+        indexed_groups.append((index, candidates))
+        progress_bar.update(1)
+    return indexed_groups
 
 
 def _load_tqdm() -> Any:
@@ -500,6 +553,7 @@ def run_grpo_training(
     output_dir: str | Path,
     samples: int = 4,
     generation_batch_size: int = 1,
+    sampling_devices: int = 1,
     max_new_tokens: int = 512,
     rounds: int = 1,
     epochs: int = 1,
@@ -534,8 +588,18 @@ def run_grpo_training(
         raise ValueError("min_consensus must be in the interval (0, 1]")
     if samples < 2:
         raise ValueError("GRPO requires at least two samples per problem")
-    if min(generation_batch_size, rounds, epochs, batch_size, max_length) < 1:
-        raise ValueError("batch sizes, rounds, epochs, and max_length must be positive")
+    if min(
+        generation_batch_size,
+        sampling_devices,
+        rounds,
+        epochs,
+        batch_size,
+        max_length,
+    ) < 1:
+        raise ValueError(
+            "batch sizes, sampling_devices, rounds, epochs, and max_length "
+            "must be positive"
+        )
     if learning_rate <= 0 or lora_rank < 1 or lora_alpha < 1:
         raise ValueError("learning_rate, lora_rank, and lora_alpha must be positive")
     if not 0.0 <= lora_dropout < 1.0:
@@ -560,6 +624,52 @@ def run_grpo_training(
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
     optimizer = torch.optim.AdamW(trainable_parameters, lr=learning_rate)
+    if sampling_devices > 1:
+        if device.type != "cuda":
+            raise ValueError("--sampling-devices greater than 1 requires CUDA")
+        available_devices = torch.cuda.device_count()
+        if sampling_devices > available_devices:
+            raise ValueError(
+                f"--sampling-devices={sampling_devices} requested, but only "
+                f"{available_devices} CUDA devices are visible"
+            )
+
+    primary_device = next(model.parameters()).device
+    primary_index = (
+        primary_device.index
+        if primary_device.index is not None
+        else torch.cuda.current_device()
+        if primary_device.type == "cuda"
+        else None
+    )
+    active_sampling_devices = min(sampling_devices, len(problems))
+    visible_indices = (
+        list(range(torch.cuda.device_count()))
+        if device.type == "cuda"
+        else []
+    )
+    sampling_device_indices = (
+        [primary_index]
+        + [
+            index
+            for index in visible_indices
+            if index != primary_index
+        ][: active_sampling_devices - 1]
+        if device.type == "cuda"
+        else [None]
+    )
+    sampling_models = [model]
+    for device_index in sampling_device_indices[1:]:
+        sampling_device = torch.device(f"cuda:{device_index}")
+        print(
+            f"Creating rollout model replica on {sampling_device}...",
+            flush=True,
+        )
+        replica = deepcopy(model).to(sampling_device)
+        replica.requires_grad_(False)
+        replica.eval()
+        sampling_models.append(replica)
+
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, object]] = []
@@ -568,41 +678,77 @@ def run_grpo_training(
         round_name = f"round-{round_index:02d}"
         set_seed(seed + round_index)
         model.eval()
+        for replica in sampling_models[1:]:
+            replica.load_state_dict(model.state_dict())
+            replica.eval()
         print(
             f"{round_name}: sampling {samples} rollouts for "
-            f"{len(problems)} problems...",
+            f"{len(problems)} problems across {len(sampling_models)} "
+            "sampling replica(s)...",
             flush=True,
         )
-        generated = iter(
-            generate_candidate_batch(
-                problems,
-                model,
-                tokenizer,
-                samples=samples,
-                max_new_tokens=max_new_tokens,
-                temperature=1.0,
-                top_p=1.0,
-                top_k=0,
-                batch_size=generation_batch_size,
-            )
-        )
-        candidates: list[Candidate] = []
-        problem_iterator = progress(
+        problem_shards = _partition_problems(
             problems,
+            len(sampling_models),
+        )
+        grouped_candidates: list[list[Candidate] | None] = [
+            None
+        ] * len(problems)
+        with progress(
             total=len(problems),
             desc=f"{round_name} sampling",
             unit="problem",
             dynamic_ncols=True,
             mininterval=1.0,
-        )
-        for problem in problem_iterator:
-            group = list(islice(generated, samples))
-            if len(group) != samples:
-                raise RuntimeError(
-                    f"generation returned fewer than {samples} samples "
-                    f"for problem {problem.id!r}"
+        ) as sampling_progress:
+            if len(problem_shards) == 1:
+                indexed_groups = _generate_problem_shard(
+                    problem_shards[0],
+                    sampling_models[0],
+                    tokenizer,
+                    samples=samples,
+                    max_new_tokens=max_new_tokens,
+                    generation_batch_size=generation_batch_size,
+                    progress_bar=sampling_progress,
                 )
-            candidates.extend(group)
+                worker_results = [indexed_groups]
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=len(problem_shards)
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            _generate_problem_shard,
+                            shard,
+                            sampling_model,
+                            tokenizer,
+                            samples=samples,
+                            max_new_tokens=max_new_tokens,
+                            generation_batch_size=generation_batch_size,
+                            progress_bar=sampling_progress,
+                        )
+                        for shard, sampling_model in zip(
+                            problem_shards,
+                            sampling_models,
+                            strict=True,
+                        )
+                    ]
+                    worker_results = [
+                        future.result()
+                        for future in futures
+                    ]
+
+        for worker_result in worker_results:
+            for problem_index, candidate_group in worker_result:
+                grouped_candidates[problem_index] = candidate_group
+        if any(group is None for group in grouped_candidates):
+            raise RuntimeError("parallel sampling did not return every problem")
+        candidates = [
+            candidate
+            for group in grouped_candidates
+            if group is not None
+            for candidate in group
+        ]
 
         verified = (
             verify_candidates(problems, candidates)
@@ -765,6 +911,7 @@ def run_grpo_training(
                 "min_consensus": min_consensus,
                 "samples_per_problem": samples,
                 "generation_batch_size": generation_batch_size,
+                "sampling_devices": len(sampling_models),
                 "max_new_tokens": max_new_tokens,
                 "epochs_per_round": epochs,
                 "batch_size": batch_size,

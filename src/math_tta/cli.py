@@ -126,6 +126,12 @@ def _parser() -> argparse.ArgumentParser:
     grpo.add_argument("--model", default="Qwen/Qwen3-0.6B")
     grpo.add_argument("--samples", type=int, default=4)
     grpo.add_argument("--generation-batch-size", type=int, default=1)
+    grpo.add_argument(
+        "--sampling-devices",
+        type=int,
+        default=1,
+        help="number of visible CUDA GPUs to use for parallel rollout sampling",
+    )
     grpo.add_argument("--max-new-tokens", type=int, default=512)
     grpo.add_argument("--rounds", type=int, default=1)
     grpo.add_argument("--epochs", type=int, default=1)
@@ -304,6 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_dir=arguments.output_dir,
                 samples=arguments.samples,
                 generation_batch_size=arguments.generation_batch_size,
+                sampling_devices=arguments.sampling_devices,
                 max_new_tokens=arguments.max_new_tokens,
                 rounds=arguments.rounds,
                 epochs=arguments.epochs,

@@ -1,8 +1,10 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from math_tta.data import Candidate, Problem, Rollout
 from math_tta.rl_training import (
+    _generate_problem_shard,
+    _partition_problems,
     _padded_old_logprob_rows,
     assign_pseudo_label_rewards,
     group_relative_advantages,
@@ -11,6 +13,52 @@ from math_tta.rl_training import (
 
 
 class GrpoTests(unittest.TestCase):
+    def test_problem_shards_are_balanced_and_keep_original_indices(self) -> None:
+        problems = [Problem(f"q{index}", f"question {index}") for index in range(5)]
+
+        shards = _partition_problems(problems, worker_count=2)
+
+        self.assertEqual(
+            [[index for index, _ in shard] for shard in shards],
+            [[0, 2, 4], [1, 3]],
+        )
+
+    def test_generate_problem_shard_returns_all_samples_per_original_problem(
+        self,
+    ) -> None:
+        problems = [
+            (3, Problem("q3", "question 3")),
+            (7, Problem("q7", "question 7")),
+        ]
+        candidates = [
+            Candidate("q3", "question 3", "answer 1"),
+            Candidate("q3", "question 3", "answer 2"),
+            Candidate("q7", "question 7", "answer 1"),
+            Candidate("q7", "question 7", "answer 2"),
+        ]
+        progress = Mock()
+
+        with patch(
+            "math_tta.rl_training.generate_candidate_batch",
+            return_value=iter(candidates),
+        ) as generate:
+            result = _generate_problem_shard(
+                problems,
+                model=object(),
+                tokenizer=object(),
+                samples=2,
+                max_new_tokens=16,
+                generation_batch_size=1,
+                progress_bar=progress,
+            )
+
+        self.assertEqual(
+            [(index, [candidate.id for candidate in group]) for index, group in result],
+            [(3, ["q3", "q3"]), (7, ["q7", "q7"])],
+        )
+        self.assertEqual(progress.update.call_count, 2)
+        generate.assert_called_once()
+
     def test_requires_tqdm_before_loading_model(self) -> None:
         with (
             patch("math_tta.rl_training.set_seed"),
