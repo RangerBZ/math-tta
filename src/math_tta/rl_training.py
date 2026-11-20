@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+import sys
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from itertools import islice
 from math import isfinite, sqrt
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
+from math_tta.answers import extract_answer, normalize_answer
 from math_tta.data import Candidate, Problem, Rollout, write_jsonl
 from math_tta.generation import generate_candidate_batch, set_seed
 from math_tta.model_training import (
@@ -18,6 +20,23 @@ from math_tta.model_training import (
     save_training_checkpoint,
 )
 from math_tta.verification import verify_candidates, verification_metrics
+
+RewardMode = Literal["verifier", "pseudo-label"]
+
+
+def _print_progress(label: str, completed: int, total: int) -> None:
+    if total < 1:
+        raise ValueError("progress total must be positive")
+    width = 24
+    fraction = min(completed / total, 1.0)
+    filled = int(width * fraction)
+    bar = "#" * filled + "-" * (width - filled)
+    sys.stderr.write(
+        f"\r{label} [{bar}] {completed}/{total} ({fraction:.0%})"
+    )
+    if completed >= total:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
 
 
 def group_relative_advantages(
@@ -46,6 +65,101 @@ def group_relative_advantages(
         for index in indices:
             advantages[index] = (rewards[index] - mean) / standard_deviation
     return advantages
+
+
+def assign_pseudo_label_rewards(
+    candidates: Sequence[Candidate],
+    *,
+    min_consensus: float = 0.5,
+) -> tuple[list[float], list[dict[str, object]]]:
+    if not candidates:
+        raise ValueError("pseudo-label rewards require at least one candidate")
+    if not 0.0 < min_consensus <= 1.0:
+        raise ValueError("min_consensus must be in the interval (0, 1]")
+
+    candidates_by_problem: dict[str, list[int]] = defaultdict(list)
+    for index, candidate in enumerate(candidates):
+        candidates_by_problem[candidate.id].append(index)
+
+    rewards = [0.0] * len(candidates)
+    group_records: list[dict[str, object]] = []
+    for problem_id, indices in candidates_by_problem.items():
+        questions = {candidates[index].question for index in indices}
+        if len(questions) != 1:
+            raise ValueError(
+                f"candidates for problem {problem_id!r} have inconsistent questions"
+            )
+
+        normalized_answers: dict[int, str | None] = {}
+        answer_counts: Counter[str] = Counter()
+        for index in indices:
+            extracted = extract_answer(candidates[index].completion)
+            normalized = normalize_answer(extracted) if extracted is not None else None
+            normalized_answers[index] = normalized
+            if normalized is not None:
+                answer_counts[normalized] += 1
+
+        highest_count = max(answer_counts.values(), default=0)
+        winners = [
+            answer
+            for answer, count in answer_counts.items()
+            if count == highest_count
+        ]
+        consensus = highest_count / len(indices)
+        has_pseudo_label = (
+            len(winners) == 1
+            and consensus >= min_consensus
+        )
+        pseudo_answer = winners[0] if has_pseudo_label else None
+
+        if pseudo_answer is not None:
+            for index in indices:
+                rewards[index] = float(
+                    normalized_answers[index] == pseudo_answer
+                )
+
+        group_records.append(
+            {
+                "id": problem_id,
+                "question": candidates[indices[0]].question,
+                "pseudo_answer": pseudo_answer,
+                "consensus": consensus,
+                "sample_count": len(indices),
+                "parseable_samples": sum(
+                    normalized_answers[index] is not None for index in indices
+                ),
+                "accepted": has_pseudo_label,
+            }
+        )
+    return rewards, group_records
+
+
+def _pseudo_label_metrics(
+    candidates: Sequence[Candidate],
+    rewards: Sequence[float],
+    group_records: Sequence[dict[str, object]],
+) -> dict[str, float | int]:
+    accepted_groups = [record for record in group_records if record["accepted"]]
+    parseable_samples = sum(
+        extract_answer(candidate.completion) is not None
+        for candidate in candidates
+    )
+    return {
+        "problems": len(group_records),
+        "candidates": len(candidates),
+        "parseable_candidates": parseable_samples,
+        "parse_rate": parseable_samples / len(candidates),
+        "pseudo_labeled_groups": len(accepted_groups),
+        "abstained_groups": len(group_records) - len(accepted_groups),
+        "pseudo_label_coverage": len(accepted_groups) / len(group_records),
+        "mean_accepted_consensus": (
+            sum(float(record["consensus"]) for record in accepted_groups)
+            / len(accepted_groups)
+            if accepted_groups
+            else 0.0
+        ),
+        "pseudo_label_reward_rate": sum(rewards) / len(rewards),
+    }
 
 
 def _collate_candidates(
@@ -144,11 +258,13 @@ def _score_old_policy(
     torch: Any,
     device: Any,
     *,
+    label: str,
     batch_size: int,
     max_length: int,
 ) -> list[tuple[float, ...]]:
     scores: list[tuple[float, ...]] = []
     model.eval()
+    progress_interval = max(1, (len(candidates) + 19) // 20)
     with torch.inference_mode():
         for start in range(0, len(candidates), batch_size):
             batch_candidates = candidates[start : start + batch_size]
@@ -170,6 +286,17 @@ def _score_old_policy(
                         float(value)
                         for value in row[mask.bool()].cpu().tolist()
                     )
+                )
+            completed = min(start + len(batch_candidates), len(candidates))
+            if (
+                completed == len(candidates)
+                or completed == len(batch_candidates)
+                or completed % progress_interval < len(batch_candidates)
+            ):
+                _print_progress(
+                    label,
+                    completed,
+                    len(candidates),
                 )
     return scores
 
@@ -264,9 +391,11 @@ def _train_grpo_rollouts(
     losses: list[float] = []
     clipped_fractions: list[float] = []
     optimizer_steps = 0
-    progress_interval = max(1, (len(trainable_rollouts) + 19) // 20)
-
     for epoch_index in range(1, epochs + 1):
+        epoch_step_count = (
+            len(trainable_rollouts) + batch_size - 1
+        ) // batch_size
+        epoch_step = 0
         order = torch.randperm(
             len(trainable_rollouts),
             generator=generator,
@@ -318,6 +447,7 @@ def _train_grpo_rollouts(
             torch.nn.utils.clip_grad_norm_(trainable_parameters, max_grad_norm)
             optimizer.step()
             optimizer_steps += 1
+            epoch_step += 1
             losses.append(float(loss.detach().float().cpu()))
             clipped_fractions.append(
                 float(
@@ -333,14 +463,14 @@ def _train_grpo_rollouts(
             )
 
             if (
-                optimizer_steps == 1
-                or optimizer_steps % progress_interval == 0
-                or start + batch_size >= len(order)
+                epoch_step == epoch_step_count
+                or epoch_step == 1
+                or epoch_step % max(1, (epoch_step_count + 19) // 20) == 0
             ):
-                print(
-                    f"GRPO epoch {epoch_index}/{epochs}: "
-                    f"rollouts {min(start + batch_size, len(order))}/{len(order)}",
-                    flush=True,
+                _print_progress(
+                    f"GRPO epoch {epoch_index}/{epochs}",
+                    epoch_step,
+                    epoch_step_count,
                 )
 
     model.config.use_cache = True
@@ -352,9 +482,14 @@ def _train_grpo_rollouts(
     }
 
 
-def _rollout_record(rollout: Rollout) -> dict[str, object]:
+def _rollout_record(
+    rollout: Rollout,
+    *,
+    reward_mode: RewardMode,
+    pseudo_label_record: dict[str, object] | None = None,
+) -> dict[str, object]:
     candidate = rollout.candidate
-    return {
+    record: dict[str, object] = {
         "id": candidate.id,
         "question": candidate.question,
         "completion": candidate.completion,
@@ -363,7 +498,17 @@ def _rollout_record(rollout: Rollout) -> dict[str, object]:
         "reward": rollout.reward,
         "advantage": rollout.advantage,
         "old_policy_logprobs": list(rollout.old_policy_logprobs),
+        "reward_source": reward_mode,
     }
+    if pseudo_label_record is not None:
+        record.update(
+            {
+                "pseudo_answer": pseudo_label_record["pseudo_answer"],
+                "pseudo_label_consensus": pseudo_label_record["consensus"],
+                "pseudo_label_accepted": pseudo_label_record["accepted"],
+            }
+        )
+    return record
 
 
 def run_grpo_training(
@@ -385,6 +530,8 @@ def run_grpo_training(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     tune_mode: TuneMode = "lora",
+    reward_mode: RewardMode = "verifier",
+    min_consensus: float = 0.5,
     seed: int = 42,
 ) -> list[dict[str, object]]:
     if not problems:
@@ -395,8 +542,14 @@ def run_grpo_training(
         raise ValueError(
             "training input contains GSM8K test-split ids; use the training split only"
         )
-    if any(problem.answer is None for problem in problems):
+    if reward_mode not in {"verifier", "pseudo-label"}:
+        raise ValueError("reward_mode must be 'verifier' or 'pseudo-label'")
+    if reward_mode == "verifier" and any(
+        problem.answer is None for problem in problems
+    ):
         raise ValueError("every training problem must include a reference answer")
+    if not 0.0 < min_consensus <= 1.0:
+        raise ValueError("min_consensus must be in the interval (0, 1]")
     if samples < 2:
         raise ValueError("GRPO requires at least two samples per problem")
     if min(generation_batch_size, rounds, epochs, batch_size, max_length) < 1:
@@ -451,7 +604,7 @@ def run_grpo_training(
             )
         )
         candidates: list[Candidate] = []
-        progress_interval = max(1, (len(problems) + 19) // 20)
+        progress_interval = max(1, (len(problems) + 99) // 100)
         for problem_index, problem in enumerate(problems, start=1):
             group = list(islice(generated, samples))
             if len(group) != samples:
@@ -461,16 +614,20 @@ def run_grpo_training(
                 )
             candidates.extend(group)
             if (
-                problem_index == 1
-                or problem_index % progress_interval == 0
+                problem_index % progress_interval == 0
                 or problem_index == len(problems)
             ):
-                print(
-                    f"{round_name}: sampled {problem_index}/{len(problems)} problems",
-                    flush=True,
+                _print_progress(
+                    f"{round_name} sampling",
+                    problem_index,
+                    len(problems),
                 )
 
-        verified = verify_candidates(problems, candidates)
+        verified = (
+            verify_candidates(problems, candidates)
+            if reward_mode == "verifier"
+            else None
+        )
         print(f"{round_name}: scoring old-policy token probabilities...", flush=True)
         old_logprobs = _score_old_policy(
             candidates,
@@ -478,10 +635,24 @@ def run_grpo_training(
             tokenizer,
             torch,
             device,
+            label=f"{round_name} scoring",
             batch_size=batch_size,
             max_length=max_length,
         )
-        rewards = [1.0 if item.is_correct else 0.0 for item in verified]
+        pseudo_label_groups: list[dict[str, object]] = []
+        if verified is not None:
+            rewards = [1.0 if item.is_correct else 0.0 for item in verified]
+            metrics: dict[str, object] = {
+                **verification_metrics(verified),
+            }
+        else:
+            rewards, pseudo_label_groups = assign_pseudo_label_rewards(
+                candidates,
+                min_consensus=min_consensus,
+            )
+            metrics = {
+                **_pseudo_label_metrics(candidates, rewards, pseudo_label_groups),
+            }
         advantages = group_relative_advantages(
             [candidate.id for candidate in candidates],
             rewards,
@@ -502,9 +673,6 @@ def run_grpo_training(
             )
         ]
 
-        metrics: dict[str, object] = {
-            **verification_metrics(verified),
-        }
         grouped_rewards: dict[str, list[float]] = defaultdict(list)
         for candidate, reward in zip(candidates, rewards, strict=True):
             grouped_rewards[candidate.id].append(reward)
@@ -517,22 +685,42 @@ def run_grpo_training(
                 "objective": "grpo",
                 "round": round_index,
                 "mixed_reward_groups": mixed_groups,
+                "reward_mode": reward_mode,
                 "zero_advantage_rollouts": sum(
                     rollout.advantage == 0 for rollout in rollouts
                 ),
                 "clip_epsilon": clip_epsilon,
                 "tune_mode": tune_mode,
+                "min_consensus": min_consensus,
             }
         )
 
+        pseudo_label_by_id = {
+            str(record["id"]): record for record in pseudo_label_groups
+        }
         write_jsonl(
             output_root / f"rollouts-{round_name}.jsonl",
-            (_rollout_record(rollout) for rollout in rollouts),
+            (
+                _rollout_record(
+                    rollout,
+                    reward_mode=reward_mode,
+                    pseudo_label_record=pseudo_label_by_id.get(
+                        rollout.candidate.id
+                    ),
+                )
+                for rollout in rollouts
+            ),
         )
-        write_jsonl(
-            output_root / f"verified-{round_name}.jsonl",
-            (item.to_record() for item in verified),
-        )
+        if verified is not None:
+            write_jsonl(
+                output_root / f"verified-{round_name}.jsonl",
+                (item.to_record() for item in verified),
+            )
+        else:
+            write_jsonl(
+                output_root / f"pseudo-labels-{round_name}.jsonl",
+                pseudo_label_groups,
+            )
         if mixed_groups:
             metrics.update(
                 _train_grpo_rollouts(
@@ -590,6 +778,8 @@ def run_grpo_training(
                 "objective": "grpo",
                 "model": model_id,
                 "tune_mode": tune_mode,
+                "reward_mode": reward_mode,
+                "min_consensus": min_consensus,
                 "samples_per_problem": samples,
                 "generation_batch_size": generation_batch_size,
                 "max_new_tokens": max_new_tokens,

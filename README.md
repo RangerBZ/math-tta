@@ -150,10 +150,71 @@ KL penalty, PPO's value critic/clipping, OPSD, or SDPO. It saves
 `rollouts-round-NN.jsonl` with rewards, advantages, and old-policy token
 log-probabilities, alongside verifier metrics and per-round checkpoints.
 
-Unparseable generations count as failed attempts. Answer agreement does not
-decide which traces train the model: only the reference-answer verifier does.
-The saved adapter is PEFT-format and requires the original base model when
-loaded for inference.
+### Majority pseudo-label reward mode
+
+Use `--reward-mode pseudo-label` for a TTRL-style baseline. This mode extracts
+and normalizes final answers from each question's rollouts, selects a unique
+plurality answer only when its share meets `--min-consensus` (default `0.5`),
+and rewards rollouts that match it. Tied or below-threshold groups are
+abstentions with zero rewards. Reference answers are not read by this reward
+path; `--input` may omit `answer` fields. Test-split IDs remain disallowed for
+training to prevent evaluation leakage.
+
+Run a small LoRA pilot from the repository root:
+
+```bash
+python -m math_tta.cli grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-pseudolabel-grpo \
+  --model Qwen/Qwen3-0.6B \
+  --reward-mode pseudo-label \
+  --min-consensus 0.5 \
+  --samples 4 \
+  --limit-problems 128 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
+
+By default, the final LoRA checkpoint is
+`outputs/qwen3-pseudolabel-grpo/final-adapter/`. Evaluate it on the held-out
+GSM8K test split by loading the base model with that adapter, then scoring the
+generated candidates:
+
+```bash
+python -m math_tta.cli generate \
+  --input data/gsm8k_test.jsonl \
+  --output outputs/qwen3-pseudolabel-grpo/test-candidates.jsonl \
+  --model Qwen/Qwen3-0.6B \
+  --adapter outputs/qwen3-pseudolabel-grpo/final-adapter \
+  --samples 8 \
+  --seed 42
+
+python -m math_tta.cli evaluate \
+  --problems data/gsm8k_test.jsonl \
+  --candidates outputs/qwen3-pseudolabel-grpo/test-candidates.jsonl
+```
+
+To run full fine-tuning, replace `--tune-mode lora` with `--tune-mode full`.
+The resulting `final-model/` is a standalone model checkpoint: pass that path
+to `generate --model` and omit `--adapter`. Pseudo-label runs save
+`pseudo-labels-round-NN.jsonl`, with the inferred answer, consensus, and
+abstention status. Their metrics report pseudo-label coverage and consensus,
+not accuracy against the unused training answers. The GRPO command displays
+progress bars for per-round sampling, rollout scoring, and each optimization
+epoch in the terminal.
+
+Unparseable generations count as failed attempts. In verifier mode, answer
+agreement does not decide which traces train the model; the reference-answer
+verifier does. In pseudo-label mode, normalized within-group answer agreement
+is the reward signal and can reinforce a wrong answer. LoRA checkpoints are
+PEFT-format and require the original base model when loaded for inference.
 
 Evaluate the final adapter by generating from the base model with that adapter
 attached:

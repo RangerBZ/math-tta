@@ -138,6 +138,21 @@ def _parser() -> argparse.ArgumentParser:
     grpo.add_argument("--lora-alpha", type=int, default=16)
     grpo.add_argument("--lora-dropout", type=float, default=0.05)
     grpo.add_argument(
+        "--reward-mode",
+        choices=("verifier", "pseudo-label"),
+        default="verifier",
+        help=(
+            "use labeled-answer verification or within-group majority "
+            "pseudo-label rewards"
+        ),
+    )
+    grpo.add_argument(
+        "--min-consensus",
+        type=float,
+        default=0.5,
+        help="minimum unique plurality fraction required for pseudo-label rewards",
+    )
+    grpo.add_argument(
         "--tune-mode",
         choices=("lora", "full"),
         default="lora",
@@ -301,6 +316,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lora_alpha=arguments.lora_alpha,
                 lora_dropout=arguments.lora_dropout,
                 tune_mode=arguments.tune_mode,
+                reward_mode=arguments.reward_mode,
+                min_consensus=arguments.min_consensus,
                 seed=arguments.seed,
             )
             print(json.dumps(summaries, indent=2, sort_keys=True))
