@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from itertools import islice
@@ -24,19 +23,14 @@ from math_tta.verification import verify_candidates, verification_metrics
 RewardMode = Literal["verifier", "pseudo-label"]
 
 
-def _print_progress(label: str, completed: int, total: int) -> None:
-    if total < 1:
-        raise ValueError("progress total must be positive")
-    width = 24
-    fraction = min(completed / total, 1.0)
-    filled = int(width * fraction)
-    bar = "#" * filled + "-" * (width - filled)
-    sys.stderr.write(
-        f"\r{label} [{bar}] {completed}/{total} ({fraction:.0%})"
-    )
-    if completed >= total:
-        sys.stderr.write("\n")
-    sys.stderr.flush()
+def _load_tqdm() -> Any:
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as error:
+        raise RuntimeError(
+            'Progress bars require tqdm. Run `python -m pip install -e ".[train]"`.'
+        ) from error
+    return tqdm
 
 
 def group_relative_advantages(
@@ -261,12 +255,19 @@ def _score_old_policy(
     label: str,
     batch_size: int,
     max_length: int,
+    progress: Any,
 ) -> list[tuple[float, ...]]:
     scores: list[tuple[float, ...]] = []
     model.eval()
-    progress_interval = max(1, (len(candidates) + 19) // 20)
     with torch.inference_mode():
-        for start in range(0, len(candidates), batch_size):
+        batches = range(0, len(candidates), batch_size)
+        for start in progress(
+            batches,
+            desc=label,
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+        ):
             batch_candidates = candidates[start : start + batch_size]
             batch = _collate_candidates(
                 batch_candidates,
@@ -286,17 +287,6 @@ def _score_old_policy(
                         float(value)
                         for value in row[mask.bool()].cpu().tolist()
                     )
-                )
-            completed = min(start + len(batch_candidates), len(candidates))
-            if (
-                completed == len(candidates)
-                or completed == len(batch_candidates)
-                or completed % progress_interval < len(batch_candidates)
-            ):
-                _print_progress(
-                    label,
-                    completed,
-                    len(candidates),
                 )
     return scores
 
@@ -374,6 +364,7 @@ def _train_grpo_rollouts(
     max_grad_norm: float,
     max_length: int,
     seed: int,
+    progress: Any,
 ) -> dict[str, float | int]:
     trainable_rollouts = [rollout for rollout in rollouts if rollout.advantage != 0]
     if not trainable_rollouts:
@@ -392,15 +383,18 @@ def _train_grpo_rollouts(
     clipped_fractions: list[float] = []
     optimizer_steps = 0
     for epoch_index in range(1, epochs + 1):
-        epoch_step_count = (
-            len(trainable_rollouts) + batch_size - 1
-        ) // batch_size
-        epoch_step = 0
         order = torch.randperm(
             len(trainable_rollouts),
             generator=generator,
         ).tolist()
-        for start in range(0, len(order), batch_size):
+        batches = range(0, len(order), batch_size)
+        for start in progress(
+            batches,
+            desc=f"GRPO epoch {epoch_index}/{epochs}",
+            unit="step",
+            dynamic_ncols=True,
+            mininterval=1.0,
+        ):
             batch_rollouts = [
                 trainable_rollouts[index]
                 for index in order[start : start + batch_size]
@@ -447,7 +441,6 @@ def _train_grpo_rollouts(
             torch.nn.utils.clip_grad_norm_(trainable_parameters, max_grad_norm)
             optimizer.step()
             optimizer_steps += 1
-            epoch_step += 1
             losses.append(float(loss.detach().float().cpu()))
             clipped_fractions.append(
                 float(
@@ -461,17 +454,6 @@ def _train_grpo_rollouts(
                     / response_mask.sum().clamp_min(1.0).cpu()
                 )
             )
-
-            if (
-                epoch_step == epoch_step_count
-                or epoch_step == 1
-                or epoch_step % max(1, (epoch_step_count + 19) // 20) == 0
-            ):
-                _print_progress(
-                    f"GRPO epoch {epoch_index}/{epochs}",
-                    epoch_step,
-                    epoch_step_count,
-                )
 
     model.config.use_cache = True
     return {
@@ -566,6 +548,7 @@ def run_grpo_training(
         raise ValueError("tune_mode must be 'lora' or 'full'")
 
     set_seed(seed)
+    progress = _load_tqdm()
     torch, tokenizer, model, device = load_trainable_model(
         model_id,
         tune_mode=tune_mode,
@@ -604,8 +587,15 @@ def run_grpo_training(
             )
         )
         candidates: list[Candidate] = []
-        progress_interval = max(1, (len(problems) + 99) // 100)
-        for problem_index, problem in enumerate(problems, start=1):
+        problem_iterator = progress(
+            problems,
+            total=len(problems),
+            desc=f"{round_name} sampling",
+            unit="problem",
+            dynamic_ncols=True,
+            mininterval=1.0,
+        )
+        for problem in problem_iterator:
             group = list(islice(generated, samples))
             if len(group) != samples:
                 raise RuntimeError(
@@ -613,15 +603,6 @@ def run_grpo_training(
                     f"for problem {problem.id!r}"
                 )
             candidates.extend(group)
-            if (
-                problem_index % progress_interval == 0
-                or problem_index == len(problems)
-            ):
-                _print_progress(
-                    f"{round_name} sampling",
-                    problem_index,
-                    len(problems),
-                )
 
         verified = (
             verify_candidates(problems, candidates)
@@ -638,6 +619,7 @@ def run_grpo_training(
             label=f"{round_name} scoring",
             batch_size=batch_size,
             max_length=max_length,
+            progress=progress,
         )
         pseudo_label_groups: list[dict[str, object]] = []
         if verified is not None:
@@ -736,6 +718,7 @@ def run_grpo_training(
                     max_grad_norm=max_grad_norm,
                     max_length=max_length,
                     seed=seed + round_index,
+                    progress=progress,
                 )
             )
         else:

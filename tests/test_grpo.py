@@ -1,11 +1,9 @@
 import unittest
-from io import StringIO
 from unittest.mock import patch
 
 from math_tta.data import Candidate, Problem, Rollout
 from math_tta.rl_training import (
     _padded_old_logprob_rows,
-    _print_progress,
     assign_pseudo_label_rewards,
     group_relative_advantages,
     run_grpo_training,
@@ -13,12 +11,23 @@ from math_tta.rl_training import (
 
 
 class GrpoTests(unittest.TestCase):
-    def test_progress_bar_reports_completion(self) -> None:
-        output = StringIO()
-        with patch("math_tta.rl_training.sys.stderr", output):
-            _print_progress("training", 3, 3)
-
-        self.assertIn("[########################] 3/3 (100%)", output.getvalue())
+    def test_requires_tqdm_before_loading_model(self) -> None:
+        with (
+            patch("math_tta.rl_training.set_seed"),
+            patch(
+                "math_tta.rl_training._load_tqdm",
+                side_effect=RuntimeError("tqdm is required"),
+            ),
+            patch("math_tta.rl_training.load_trainable_model") as load_model,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "tqdm is required"):
+                run_grpo_training(
+                    [Problem("train-00001", "question")],
+                    model_id="unused",
+                    output_dir="unused",
+                    reward_mode="pseudo-label",
+                )
+        load_model.assert_not_called()
 
     def test_group_advantages_normalize_mixed_rewards_and_zero_constant_groups(
         self,
@@ -93,6 +102,7 @@ class GrpoTests(unittest.TestCase):
     def test_pseudo_label_mode_does_not_require_reference_answers(self) -> None:
         with (
             patch("math_tta.rl_training.set_seed"),
+            patch("math_tta.rl_training._load_tqdm", return_value=object()),
             patch(
                 "math_tta.rl_training.load_trainable_model",
                 side_effect=RuntimeError("model loader reached"),

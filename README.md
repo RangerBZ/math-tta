@@ -206,9 +206,9 @@ The resulting `final-model/` is a standalone model checkpoint: pass that path
 to `generate --model` and omit `--adapter`. Pseudo-label runs save
 `pseudo-labels-round-NN.jsonl`, with the inferred answer, consensus, and
 abstention status. Their metrics report pseudo-label coverage and consensus,
-not accuracy against the unused training answers. The GRPO command displays
-progress bars for per-round sampling, rollout scoring, and each optimization
-epoch in the terminal.
+not accuracy against the unused training answers. The GRPO command uses tqdm
+progress bars with elapsed and estimated remaining time for sampling, rollout
+scoring, and each optimization epoch.
 
 Unparseable generations count as failed attempts. In verifier mode, answer
 agreement does not decide which traces train the model; the reference-answer
