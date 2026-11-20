@@ -63,7 +63,7 @@ class GrpoTests(unittest.TestCase):
         with (
             patch("math_tta.rl_training.set_seed"),
             patch(
-                "math_tta.rl_training._load_tqdm",
+                "math_tta.rl_training.load_tqdm",
                 side_effect=RuntimeError("tqdm is required"),
             ),
             patch("math_tta.rl_training.load_trainable_model") as load_model,
@@ -150,7 +150,7 @@ class GrpoTests(unittest.TestCase):
     def test_pseudo_label_mode_does_not_require_reference_answers(self) -> None:
         with (
             patch("math_tta.rl_training.set_seed"),
-            patch("math_tta.rl_training._load_tqdm", return_value=object()),
+            patch("math_tta.rl_training.load_tqdm", return_value=object()),
             patch(
                 "math_tta.rl_training.load_trainable_model",
                 side_effect=RuntimeError("model loader reached"),

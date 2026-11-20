@@ -83,8 +83,9 @@ math-tta prepare-gsm8k --split train --output data/gsm8k_train.jsonl
 ```
 
 Each record contains `id`, `question`, and the GSM8K `answer` rationale, whose
-final reference is extracted from its `####` marker. The test split can be
-exported for final evaluation, but **must not** be passed to `train`.
+final reference is extracted from its `####` marker. GSM8K has 7,473 training
+questions and 1,319 held-out test questions. The test split can be exported for
+final evaluation, but **must not** be passed to `train`.
 
 ## Run verified self-training
 
@@ -99,9 +100,10 @@ Omit `--limit-problems` to use the whole input file. Increase `--rounds` to
 regenerate from the updated model and continue LoRA training on newly verified
 traces. Training loads the base model in full precision unless CUDA supports
 BF16; this avoids silently choosing an unsupported reduced-precision mode.
-The CLI prints flushed progress during model loading, generation, and SFT, and
-flushes candidate artifacts periodically during generation. Reduce batch/context
-sizes if the available GPU memory is insufficient.
+Candidate generation displays a tqdm bar with elapsed and estimated remaining
+time, advancing once per completed problem. The training pipeline also flushes
+candidate artifacts periodically during generation. Reduce batch/context sizes
+if the available GPU memory is insufficient.
 
 The pipeline records, for each round:
 

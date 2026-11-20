@@ -15,6 +15,7 @@ from math_tta.data import (
 )
 from math_tta.generation import generate_candidates
 from math_tta.metrics import evaluate
+from math_tta.progress import load_tqdm
 from math_tta.rl_training import run_grpo_training
 from math_tta.selection import select_trajectories
 from math_tta.training import run_self_training
@@ -191,45 +192,55 @@ def main(argv: Sequence[str] | None = None) -> int:
                 adapter_path=arguments.adapter,
             )
 
-            def candidate_records() -> Iterator[dict[str, object]]:
-                sample_indices: dict[str, int] = {}
-                for candidate in candidates:
-                    sample_index = sample_indices.get(candidate.id, 0)
-                    sample_indices[candidate.id] = sample_index + 1
-                    yield {
-                        "id": candidate.id,
-                        "question": candidate.question,
-                        "completion": candidate.completion,
-                        "completion_token_ids": (
-                            list(candidate.completion_token_ids)
-                            if candidate.completion_token_ids is not None
-                            else None
-                        ),
-                        "prompt_token_ids": (
-                            list(candidate.prompt_token_ids)
-                            if candidate.prompt_token_ids is not None
-                            else None
-                        ),
-                        "sample_index": sample_index,
-                        "model": arguments.model,
-                        "adapter": arguments.adapter,
-                        "seed": arguments.seed,
-                        "samples_per_problem": arguments.samples,
-                        "max_new_tokens": arguments.max_new_tokens,
-                        "temperature": arguments.temperature,
-                        "top_p": arguments.top_p,
-                        "batch_size": arguments.batch_size,
-                        "token_logprobs": (
-                            list(candidate.token_logprobs)
-                            if candidate.token_logprobs is not None
-                            else None
-                        ),
-                    }
+            with load_tqdm()(
+                total=len(problems),
+                desc="Generating",
+                unit="problem",
+                dynamic_ncols=True,
+                mininterval=1.0,
+            ) as generation_progress:
 
-            write_jsonl(
-                arguments.output,
-                candidate_records(),
-            )
+                def candidate_records() -> Iterator[dict[str, object]]:
+                    sample_indices: dict[str, int] = {}
+                    for candidate in candidates:
+                        sample_index = sample_indices.get(candidate.id, 0)
+                        sample_indices[candidate.id] = sample_index + 1
+                        yield {
+                            "id": candidate.id,
+                            "question": candidate.question,
+                            "completion": candidate.completion,
+                            "completion_token_ids": (
+                                list(candidate.completion_token_ids)
+                                if candidate.completion_token_ids is not None
+                                else None
+                            ),
+                            "prompt_token_ids": (
+                                list(candidate.prompt_token_ids)
+                                if candidate.prompt_token_ids is not None
+                                else None
+                            ),
+                            "sample_index": sample_index,
+                            "model": arguments.model,
+                            "adapter": arguments.adapter,
+                            "seed": arguments.seed,
+                            "samples_per_problem": arguments.samples,
+                            "max_new_tokens": arguments.max_new_tokens,
+                            "temperature": arguments.temperature,
+                            "top_p": arguments.top_p,
+                            "batch_size": arguments.batch_size,
+                            "token_logprobs": (
+                                list(candidate.token_logprobs)
+                                if candidate.token_logprobs is not None
+                                else None
+                            ),
+                        }
+                        if sample_index + 1 == arguments.samples:
+                            generation_progress.update(1)
+
+                write_jsonl(
+                    arguments.output,
+                    candidate_records(),
+                )
             return 0
 
         if arguments.command == "prepare-gsm8k":

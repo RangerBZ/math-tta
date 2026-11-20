@@ -20,6 +20,7 @@ from math_tta.model_training import (
     load_trainable_model,
     save_training_checkpoint,
 )
+from math_tta.progress import load_tqdm
 from math_tta.verification import verify_candidates, verification_metrics
 
 RewardMode = Literal["verifier", "pseudo-label"]
@@ -74,16 +75,6 @@ def _generate_problem_shard(
         indexed_groups.append((index, candidates))
         progress_bar.update(1)
     return indexed_groups
-
-
-def _load_tqdm() -> Any:
-    try:
-        from tqdm.auto import tqdm
-    except ImportError as error:
-        raise RuntimeError(
-            'Progress bars require tqdm. Run `python -m pip install -e ".[train]"`.'
-        ) from error
-    return tqdm
 
 
 def group_relative_advantages(
@@ -612,7 +603,7 @@ def run_grpo_training(
         raise ValueError("tune_mode must be 'lora' or 'full'")
 
     set_seed(seed)
-    progress = _load_tqdm()
+    progress = load_tqdm()
     torch, tokenizer, model, device = load_trainable_model(
         model_id,
         tune_mode=tune_mode,
