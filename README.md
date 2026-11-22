@@ -5,10 +5,11 @@ mathematical reasoning. It can import GSM8K, sample model completions, verify
 their extracted answers against labeled references, and fine-tune on accepted
 traces using LoRA.
 
-> **Scope note:** This implements fixed-sample rejection-SFT as a baseline. It
-> does not yet implement adaptive sampling/weighting or RLVR/GRPO. Answer
-> verification checks only the final answer; it does not verify each reasoning
-> step.
+> **Scope note:** The prototype includes fixed-sample rejection-SFT, clipped
+> GRPO with verifier or majority pseudo-label rewards, and the TTA-1 adaptive
+> sampling policy described below. It does not implement adaptive trace
+> weighting or step-level verification; answer verification checks only the
+> final answer.
 
 ## Environment setup
 
@@ -56,10 +57,26 @@ PyTorch build; it uses whichever interpreter is active.
 
 The optional dependencies pin Transformers to 4.57.3 (VeOmni's exact
 requirement) and constrain Datasets to 2.16-2.21 to avoid incompatibilities
-with a VeOmni-managed stack.
-PyTorch 2.8.0+cu128 is compatible with the project's code and remains supplied
-by the existing environment; the install command above does not request a
-different PyTorch version. Avoid running `pip install torch` in this environment.
+with a VeOmni-managed stack. PyTorch is intentionally not pinned in
+`pyproject.toml`: its CUDA wheel must match the driver on the GPU node where the
+job runs.
+
+For example, CHPC `gpu035` reports driver 575.57.08 / CUDA 12.9, which cannot
+initialize the installed `torch 2.15.0+cu132` build. The project works with
+PyTorch 2.8.0+cu128 on a compatible node. In an environment you own and can
+replace, install that wheel separately:
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0"
+python -m pip install -e ".[train]"
+python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+```
+
+The final command should report a `+cu128` build and `True` for CUDA
+availability on an allocated GPU node. This replaces the existing PyTorch
+installation, so do not run it in a managed/shared environment without
+permission. Alternatively, keep the current `cu132` environment and run on a
+node whose driver supports that build.
 
 Test the model-independent components without downloading any model:
 
@@ -237,6 +254,50 @@ abstention status. Their metrics report pseudo-label coverage and consensus,
 not accuracy against the unused training answers. The GRPO command uses tqdm
 progress bars with elapsed and estimated remaining time for sampling, rollout
 scoring, and each optimization epoch.
+
+### TTA-1 adaptive sampling
+
+TTA-1 is an adaptive rollout-budget policy for `grpo --reward-mode
+pseudo-label`. It starts with `--samples` rollouts for every question, then
+adds up to two samples at a time for unresolved questions. A group is accepted
+only when its unique count-based answer winner reaches `--tta1-threshold`
+(default `0.8`) and agrees with the confidence-weighted answer winner. It stops
+sampling accepted groups; unresolved groups are sampled up to `--max-samples`
+(default `8`) and then abstain. Unparseable rollouts count in the denominator
+for count consensus but do not vote for an answer. Accepted groups reward only
+rollouts matching the agreed count winner. Fixed sampling remains the default.
+
+The confidence weight is derived from normalized mean next-token entropy over
+each generated response. This is an uncalibrated self-certainty heuristic, not
+a probability that the answer or reasoning is correct. The TTA-1 training
+command does not use GSM8K reference answers:
+
+```bash
+python -m math_tta.cli grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-tta1-grpo \
+  --model Qwen/Qwen3-0.6B \
+  --reward-mode pseudo-label \
+  --sampling-policy tta-1 \
+  --samples 4 \
+  --max-samples 8 \
+  --tta1-threshold 0.8 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
+
+Round metrics include the mean number of samples per problem, how many groups
+were extended, confidence-winner conflicts, abstentions, and pseudo-label
+coverage. Because TTA-1 uses only rollout-derived signals, it can select a
+wrong pseudo-label; evaluate on the held-out test set only after fixing the
+policy and hyperparameters.
 
 Unparseable generations count as failed attempts. In verifier mode, answer
 agreement does not decide which traces train the model; the reference-answer

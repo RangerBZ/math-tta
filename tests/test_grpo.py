@@ -1,14 +1,18 @@
+from math import log
 import unittest
 from unittest.mock import Mock, patch
 
 from math_tta.data import Candidate, Problem, Rollout
 from math_tta.rl_training import (
+    _assign_tta1_rewards,
     _generate_problem_shard,
     _partition_problems,
     _padded_old_logprob_rows,
     assign_pseudo_label_rewards,
     group_relative_advantages,
     run_grpo_training,
+    _token_self_certainty,
+    _tta1_group_decision,
 )
 
 
@@ -134,11 +138,99 @@ class GrpoTests(unittest.TestCase):
         self.assertIsNone(groups[0]["pseudo_answer"])
         self.assertFalse(groups[0]["accepted"])
 
+    def test_tta1_extends_below_consensus_threshold_and_accepts_agreement(self) -> None:
         candidates = [
-            Candidate("q2", "another question", r"\boxed{1}"),
-            Candidate("q2", "another question", r"\boxed{1}"),
-            Candidate("q2", "another question", r"\boxed{2}"),
-            Candidate("q2", "another question", r"\boxed{3}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1.0}"),
+            Candidate("q1", "question", r"\boxed{2}"),
+            Candidate("q1", "question", r"\boxed{3}"),
+        ]
+        decision = _tta1_group_decision(
+            candidates,
+            [0.7, 0.7, 0.6, 0.5],
+            threshold=0.8,
+        )
+
+        self.assertEqual(decision["count_winner"], "1")
+        self.assertEqual(decision["consensus"], 0.5)
+        self.assertFalse(decision["accepted"])
+        self.assertEqual(decision["decision_reason"], "below_consensus_threshold")
+
+        unanimous = [
+            Candidate("q2", "another question", r"\boxed{7}")
+            for _ in range(4)
+        ]
+        decision = _tta1_group_decision(
+            unanimous,
+            [0.5, 0.6, 0.4, 0.7],
+            threshold=0.8,
+        )
+        self.assertEqual(decision["count_winner"], "7")
+        self.assertEqual(decision["confidence_winner"], "7")
+        self.assertTrue(decision["accepted"])
+
+    def test_tta1_adds_sampling_when_confidence_weighted_winner_conflicts(
+        self,
+    ) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}")
+            for _ in range(5)
+        ] + [Candidate("q1", "question", r"\boxed{2}")]
+
+        decision = _tta1_group_decision(
+            candidates,
+            [0.1, 0.1, 0.1, 0.1, 0.1, 0.9],
+            threshold=0.8,
+        )
+
+        self.assertEqual(decision["consensus"], 5 / 6)
+        self.assertEqual(decision["count_winner"], "1")
+        self.assertEqual(decision["confidence_winner"], "2")
+        self.assertTrue(decision["confidence_conflict"])
+        self.assertFalse(decision["accepted"])
+        self.assertEqual(decision["decision_reason"], "confidence_conflict")
+
+    def test_tta1_does_not_reward_conflicting_winners(self) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}")
+            for _ in range(5)
+        ] + [Candidate("q1", "question", r"\boxed{2}")]
+        rewards, groups = _assign_tta1_rewards(
+            candidates,
+            [0.1, 0.1, 0.1, 0.1, 0.1, 0.9],
+            threshold=0.8,
+        )
+
+        self.assertEqual(rewards, [0.0] * 6)
+        self.assertFalse(groups[0]["accepted"])
+        self.assertEqual(groups[0]["sample_count"], 6)
+
+        agreed_candidates = [
+            Candidate("q2", "another question", r"\boxed{1}")
+            for _ in range(5)
+        ] + [Candidate("q2", "another question", r"\boxed{2}")]
+        rewards, groups = _assign_tta1_rewards(
+            agreed_candidates,
+            [0.3, 0.3, 0.3, 0.3, 0.3, 0.1],
+            threshold=0.8,
+        )
+        self.assertEqual(rewards, [1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+        self.assertTrue(groups[0]["accepted"])
+
+    def test_tta1_confidence_uses_normalized_mean_token_entropy(self) -> None:
+        self.assertEqual(_token_self_certainty(0.0, 100), 1.0)
+        self.assertAlmostEqual(
+            _token_self_certainty(0.5 * log(100), 100),
+            0.5,
+        )
+        self.assertEqual(_token_self_certainty(log(100), 100), 0.0)
+
+    def test_pseudo_label_rejects_below_minimum_consensus(self) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{2}"),
+            Candidate("q1", "question", r"\boxed{3}"),
         ]
         rewards, groups = assign_pseudo_label_rewards(
             candidates,
@@ -171,6 +263,28 @@ class GrpoTests(unittest.TestCase):
                 [Problem("train-00001", "question")],
                 model_id="unused",
                 output_dir="unused",
+            )
+
+    def test_tta1_requires_pseudo_label_rewards_before_loading_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires pseudo-label"):
+            run_grpo_training(
+                [Problem("train-00001", "question", "42")],
+                model_id="unused",
+                output_dir="unused",
+                sampling_policy="tta-1",
+                reward_mode="verifier",
+            )
+
+    def test_tta1_requires_max_samples_to_cover_initial_samples(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least samples"):
+            run_grpo_training(
+                [Problem("train-00001", "question")],
+                model_id="unused",
+                output_dir="unused",
+                samples=4,
+                sampling_policy="tta-1",
+                max_samples=3,
+                reward_mode="pseudo-label",
             )
 
     def test_rejects_clip_epsilon_outside_open_unit_interval_before_model_load(

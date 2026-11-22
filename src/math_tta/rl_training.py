@@ -8,7 +8,7 @@ from copy import deepcopy
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from itertools import islice
-from math import isfinite, sqrt
+from math import isclose, isfinite, log, sqrt
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -24,19 +24,27 @@ from math_tta.progress import load_tqdm
 from math_tta.verification import verify_candidates, verification_metrics
 
 RewardMode = Literal["verifier", "pseudo-label"]
+SamplingPolicy = Literal["fixed", "tta-1"]
 
 
 def _partition_problems(
     problems: Sequence[Problem],
     worker_count: int,
 ) -> list[list[tuple[int, Problem]]]:
+    return _partition_indexed_problems(list(enumerate(problems)), worker_count)
+
+
+def _partition_indexed_problems(
+    indexed_problems: Sequence[tuple[int, Problem]],
+    worker_count: int,
+) -> list[list[tuple[int, Problem]]]:
     if worker_count < 1:
         raise ValueError("worker_count must be positive")
     shards: list[list[tuple[int, Problem]]] = [
-        [] for _ in range(min(worker_count, len(problems)))
+        [] for _ in range(min(worker_count, len(indexed_problems)))
     ]
-    for index, problem in enumerate(problems):
-        shards[index % len(shards)].append((index, problem))
+    for position, indexed_problem in enumerate(indexed_problems):
+        shards[position % len(shards)].append(indexed_problem)
     return shards
 
 
@@ -75,6 +83,211 @@ def _generate_problem_shard(
         indexed_groups.append((index, candidates))
         progress_bar.update(1)
     return indexed_groups
+
+
+def _generate_indexed_problems(
+    indexed_problems: Sequence[tuple[int, Problem]],
+    sampling_models: Sequence[Any],
+    tokenizer: Any,
+    *,
+    samples: int,
+    max_new_tokens: int,
+    generation_batch_size: int,
+    progress: Any,
+    label: str,
+) -> dict[int, list[Candidate]]:
+    shards = _partition_indexed_problems(indexed_problems, len(sampling_models))
+    if not shards:
+        return {}
+
+    with progress(
+        total=len(indexed_problems),
+        desc=label,
+        unit="problem",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    ) as sampling_progress:
+        if len(shards) == 1:
+            worker_results = [
+                _generate_problem_shard(
+                    shards[0],
+                    sampling_models[0],
+                    tokenizer,
+                    samples=samples,
+                    max_new_tokens=max_new_tokens,
+                    generation_batch_size=generation_batch_size,
+                    progress_bar=sampling_progress,
+                )
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=len(shards)) as executor:
+                futures = [
+                    executor.submit(
+                        _generate_problem_shard,
+                        shard,
+                        sampling_model,
+                        tokenizer,
+                        samples=samples,
+                        max_new_tokens=max_new_tokens,
+                        generation_batch_size=generation_batch_size,
+                        progress_bar=sampling_progress,
+                    )
+                    for shard, sampling_model in zip(
+                        shards,
+                        sampling_models,
+                        strict=True,
+                    )
+                ]
+                worker_results = [future.result() for future in futures]
+
+    generated: dict[int, list[Candidate]] = {}
+    for worker_result in worker_results:
+        for problem_index, candidate_group in worker_result:
+            generated[problem_index] = candidate_group
+    if len(generated) != len(indexed_problems):
+        raise RuntimeError("sampling did not return every requested problem")
+    return generated
+
+
+def _confidence_weighted_answer(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+) -> str | None:
+    if len(candidates) != len(confidence_weights):
+        raise ValueError("each candidate must have one confidence weight")
+    weighted_counts: dict[str, float] = defaultdict(float)
+    for candidate, confidence in zip(candidates, confidence_weights, strict=True):
+        if not isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence weights must be finite values in [0, 1]")
+        answer = extract_answer(candidate.completion)
+        if answer is not None:
+            weighted_counts[normalize_answer(answer)] += confidence
+    if not weighted_counts:
+        return None
+
+    highest_weight = max(weighted_counts.values())
+    winners = [
+        answer
+        for answer, weight in weighted_counts.items()
+        if isclose(weight, highest_weight, rel_tol=1e-9, abs_tol=1e-12)
+    ]
+    return winners[0] if len(winners) == 1 else None
+
+
+def _tta1_group_decision(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    *,
+    threshold: float,
+) -> dict[str, object]:
+    if not candidates:
+        raise ValueError("TTA-1 requires at least one rollout")
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError("TTA-1 threshold must be in the interval (0, 1]")
+    if len(candidates) != len(confidence_weights):
+        raise ValueError("each candidate must have one confidence weight")
+
+    answer_counts: Counter[str] = Counter()
+    for candidate in candidates:
+        answer = extract_answer(candidate.completion)
+        if answer is not None:
+            answer_counts[normalize_answer(answer)] += 1
+    highest_count = max(answer_counts.values(), default=0)
+    count_winners = [
+        answer
+        for answer, count in answer_counts.items()
+        if count == highest_count
+    ]
+    count_winner = count_winners[0] if len(count_winners) == 1 else None
+    consensus = highest_count / len(candidates)
+    confidence_winner = _confidence_weighted_answer(
+        candidates,
+        confidence_weights,
+    )
+    accepted = (
+        count_winner is not None
+        and consensus >= threshold
+        and confidence_winner == count_winner
+    )
+    if count_winner is None:
+        reason = "no_unique_count_winner"
+    elif consensus < threshold:
+        reason = "below_consensus_threshold"
+    elif confidence_winner is None:
+        reason = "no_unique_confidence_winner"
+    elif confidence_winner != count_winner:
+        reason = "confidence_conflict"
+    else:
+        reason = "accepted"
+
+    return {
+        "count_winner": count_winner,
+        "confidence_winner": confidence_winner,
+        "consensus": consensus,
+        "sample_count": len(candidates),
+        "parseable_samples": sum(answer_counts.values()),
+        "confidence_conflict": (
+            count_winner is not None
+            and confidence_winner is not None
+            and count_winner != confidence_winner
+        ),
+        "accepted": accepted,
+        "decision_reason": reason,
+    }
+
+
+def _assign_tta1_rewards(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    *,
+    threshold: float,
+) -> tuple[list[float], list[dict[str, object]]]:
+    if len(candidates) != len(confidence_weights):
+        raise ValueError("each candidate must have one confidence weight")
+    candidates_by_problem: dict[str, list[int]] = defaultdict(list)
+    for index, candidate in enumerate(candidates):
+        candidates_by_problem[candidate.id].append(index)
+
+    rewards = [0.0] * len(candidates)
+    records: list[dict[str, object]] = []
+    for problem_id, indices in candidates_by_problem.items():
+        group_candidates = [candidates[index] for index in indices]
+        group_confidences = [confidence_weights[index] for index in indices]
+        questions = {candidate.question for candidate in group_candidates}
+        if len(questions) != 1:
+            raise ValueError(
+                f"candidates for problem {problem_id!r} have inconsistent questions"
+            )
+        decision = _tta1_group_decision(
+            group_candidates,
+            group_confidences,
+            threshold=threshold,
+        )
+        count_winner = decision["count_winner"]
+        if decision["accepted"]:
+            for index in indices:
+                answer = extract_answer(candidates[index].completion)
+                rewards[index] = float(
+                    answer is not None
+                    and normalize_answer(answer) == count_winner
+                )
+        records.append(
+            {
+                "id": problem_id,
+                "question": group_candidates[0].question,
+                "pseudo_answer": count_winner if decision["accepted"] else None,
+                "count_winner": count_winner,
+                "confidence_winner": decision["confidence_winner"],
+                "consensus": decision["consensus"],
+                "sample_count": decision["sample_count"],
+                "parseable_samples": decision["parseable_samples"],
+                "confidence_conflict": decision["confidence_conflict"],
+                "accepted": decision["accepted"],
+                "decision_reason": decision["decision_reason"],
+                "confidence_weights": group_confidences,
+            }
+        )
+    return rewards, records
 
 
 def group_relative_advantages(
@@ -277,16 +490,56 @@ def _selected_token_logprobs(
     batch: dict[str, Any],
     torch: Any,
 ) -> Any:
+    selected_logprobs, _ = _selected_token_scores(
+        model,
+        batch,
+        torch,
+        include_entropy=False,
+    )
+    return selected_logprobs
+
+
+def _selected_token_scores(
+    model: Any,
+    batch: dict[str, Any],
+    torch: Any,
+    *,
+    include_entropy: bool,
+) -> tuple[Any, Any | None]:
     output = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         use_cache=False,
     )
-    log_probs = torch.nn.functional.log_softmax(output.logits.float(), dim=-1)
-    return log_probs.gather(
-        -1,
-        batch["target_ids"].unsqueeze(-1),
-    ).squeeze(-1)
+    if not include_entropy:
+        log_probs = torch.nn.functional.log_softmax(output.logits.float(), dim=-1)
+        return (
+            log_probs.gather(
+                -1,
+                batch["target_ids"].unsqueeze(-1),
+            ).squeeze(-1),
+            None,
+        )
+
+    selected_logprob_chunks = []
+    entropy_chunks = []
+    for start in range(0, output.logits.shape[1], 16):
+        end = min(start + 16, output.logits.shape[1])
+        logits = output.logits[:, start:end, :].float()
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        selected_logprob_chunks.append(
+            log_probs.gather(
+                -1,
+                batch["target_ids"][:, start:end].unsqueeze(-1),
+            ).squeeze(-1)
+        )
+        entropy_chunks.append(
+            -(log_probs.exp() * log_probs).sum(dim=-1)
+        )
+    return (
+        torch.cat(selected_logprob_chunks, dim=1),
+        torch.cat(entropy_chunks, dim=1),
+    )
 
 
 def _score_old_policy(
@@ -300,8 +553,10 @@ def _score_old_policy(
     batch_size: int,
     max_length: int,
     progress: Any,
-) -> list[tuple[float, ...]]:
+    calculate_confidence: bool = False,
+) -> tuple[list[tuple[float, ...]], list[float]]:
     scores: list[tuple[float, ...]] = []
+    confidence_weights: list[float] = []
     model.eval()
     with torch.inference_mode():
         batches = range(0, len(candidates), batch_size)
@@ -320,19 +575,42 @@ def _score_old_policy(
                 torch=torch,
                 max_length=max_length,
             )
-            token_logprobs = _selected_token_logprobs(model, batch, torch)
-            for row, mask in zip(
-                token_logprobs,
-                batch["response_mask"],
-                strict=True,
+            token_logprobs, token_entropies = _selected_token_scores(
+                model,
+                batch,
+                torch,
+                include_entropy=calculate_confidence,
+            )
+            for row_index, (row, mask) in enumerate(
+                zip(token_logprobs, batch["response_mask"], strict=True)
             ):
+                response_mask = mask.bool()
                 scores.append(
                     tuple(
                         float(value)
-                        for value in row[mask.bool()].cpu().tolist()
+                        for value in row[response_mask].cpu().tolist()
                     )
                 )
-    return scores
+                if calculate_confidence:
+                    if token_entropies is None:
+                        raise RuntimeError("token entropy scoring returned no values")
+                    response_entropy = token_entropies[row_index][response_mask]
+                    mean_entropy = float(response_entropy.mean().cpu())
+                    confidence_weights.append(
+                        _token_self_certainty(
+                            mean_entropy,
+                            int(model.config.vocab_size),
+                        )
+                    )
+    return scores, confidence_weights
+
+
+def _token_self_certainty(mean_entropy: float, vocab_size: int) -> float:
+    if not isfinite(mean_entropy) or mean_entropy < 0:
+        raise ValueError("mean token entropy must be finite and non-negative")
+    if vocab_size < 2:
+        raise ValueError("vocab_size must be at least 2")
+    return min(1.0, max(0.0, 1.0 - mean_entropy / log(vocab_size)))
 
 
 def _collate_rollouts(
@@ -513,6 +791,7 @@ def _rollout_record(
     *,
     reward_mode: RewardMode,
     pseudo_label_record: dict[str, object] | None = None,
+    token_self_certainty: float | None = None,
 ) -> dict[str, object]:
     candidate = rollout.candidate
     record: dict[str, object] = {
@@ -526,6 +805,8 @@ def _rollout_record(
         "old_policy_logprobs": list(rollout.old_policy_logprobs),
         "reward_source": reward_mode,
     }
+    if token_self_certainty is not None:
+        record["token_self_certainty"] = token_self_certainty
     if pseudo_label_record is not None:
         record.update(
             {
@@ -534,6 +815,11 @@ def _rollout_record(
                 "pseudo_label_accepted": pseudo_label_record["accepted"],
             }
         )
+        if "count_winner" in pseudo_label_record:
+            record["count_winner"] = pseudo_label_record["count_winner"]
+            record["confidence_weighted_winner"] = pseudo_label_record[
+                "confidence_winner"
+            ]
     return record
 
 
@@ -558,6 +844,9 @@ def run_grpo_training(
     lora_dropout: float = 0.05,
     tune_mode: TuneMode = "lora",
     reward_mode: RewardMode = "verifier",
+    sampling_policy: SamplingPolicy = "fixed",
+    max_samples: int = 8,
+    tta1_threshold: float = 0.8,
     min_consensus: float = 0.5,
     seed: int = 42,
 ) -> list[dict[str, object]]:
@@ -571,6 +860,14 @@ def run_grpo_training(
         )
     if reward_mode not in {"verifier", "pseudo-label"}:
         raise ValueError("reward_mode must be 'verifier' or 'pseudo-label'")
+    if sampling_policy not in {"fixed", "tta-1"}:
+        raise ValueError("sampling_policy must be 'fixed' or 'tta-1'")
+    if sampling_policy == "tta-1" and reward_mode != "pseudo-label":
+        raise ValueError("sampling_policy='tta-1' requires pseudo-label rewards")
+    if sampling_policy == "tta-1" and max_samples < samples:
+        raise ValueError("max_samples must be at least samples for TTA-1")
+    if not 0.0 < tta1_threshold <= 1.0:
+        raise ValueError("tta1_threshold must be in the interval (0, 1]")
     if reward_mode == "verifier" and any(
         problem.answer is None for problem in problems
     ):
@@ -672,97 +969,206 @@ def run_grpo_training(
         for replica in sampling_models[1:]:
             replica.load_state_dict(model.state_dict())
             replica.eval()
-        print(
-            f"{round_name}: sampling {samples} rollouts for "
-            f"{len(problems)} problems across {len(sampling_models)} "
-            "sampling replica(s)...",
-            flush=True,
+        if sampling_policy == "tta-1":
+            print(
+                f"{round_name}: TTA-1 sampling {samples} initial rollouts for "
+                f"{len(problems)} problems (maximum {max_samples}) across "
+                f"{len(sampling_models)} sampling replica(s)...",
+                flush=True,
+            )
+        else:
+            print(
+                f"{round_name}: sampling {samples} rollouts for "
+                f"{len(problems)} problems across {len(sampling_models)} "
+                "sampling replica(s)...",
+                flush=True,
+            )
+
+        grouped_candidates: list[list[Candidate]] = [
+            [] for _ in problems
+        ]
+        grouped_old_logprobs: list[list[tuple[float, ...]]] = [
+            [] for _ in problems
+        ]
+        grouped_confidences: list[list[float]] = [[] for _ in problems]
+
+        def score_candidate_groups(
+            candidate_groups: dict[int, list[Candidate]],
+            *,
+            label: str,
+            calculate_confidence: bool,
+        ) -> None:
+            ordered_indices = sorted(candidate_groups)
+            stage_candidates = [
+                candidate
+                for problem_index in ordered_indices
+                for candidate in candidate_groups[problem_index]
+            ]
+            stage_logprobs, stage_confidences = _score_old_policy(
+                stage_candidates,
+                model,
+                tokenizer,
+                torch,
+                device,
+                label=label,
+                batch_size=batch_size,
+                max_length=max_length,
+                progress=progress,
+                calculate_confidence=calculate_confidence,
+            )
+            if calculate_confidence and len(stage_confidences) != len(
+                stage_candidates
+            ):
+                raise RuntimeError("confidence scoring missed a rollout")
+            cursor = 0
+            for problem_index in ordered_indices:
+                group_size = len(candidate_groups[problem_index])
+                grouped_old_logprobs[problem_index].extend(
+                    stage_logprobs[cursor : cursor + group_size]
+                )
+                if calculate_confidence:
+                    grouped_confidences[problem_index].extend(
+                        stage_confidences[cursor : cursor + group_size]
+                    )
+                cursor += group_size
+
+        initial_groups = _generate_indexed_problems(
+            list(enumerate(problems)),
+            sampling_models,
+            tokenizer,
+            samples=samples,
+            max_new_tokens=max_new_tokens,
+            generation_batch_size=generation_batch_size,
+            progress=progress,
+            label=f"{round_name} sampling",
         )
-        problem_shards = _partition_problems(
-            problems,
-            len(sampling_models),
-        )
-        grouped_candidates: list[list[Candidate] | None] = [
-            None
-        ] * len(problems)
-        with progress(
-            total=len(problems),
-            desc=f"{round_name} sampling",
-            unit="problem",
-            dynamic_ncols=True,
-            mininterval=1.0,
-        ) as sampling_progress:
-            if len(problem_shards) == 1:
-                indexed_groups = _generate_problem_shard(
-                    problem_shards[0],
-                    sampling_models[0],
+        for problem_index, candidate_group in initial_groups.items():
+            grouped_candidates[problem_index].extend(candidate_group)
+
+        if sampling_policy == "tta-1":
+            score_candidate_groups(
+                initial_groups,
+                label=f"{round_name} TTA-1 confidence scoring",
+                calculate_confidence=True,
+            )
+            current_samples = samples
+            stage_index = 1
+            while current_samples < max_samples:
+                active_indices = [
+                    problem_index
+                    for problem_index, candidate_group in enumerate(
+                        grouped_candidates
+                    )
+                    if not _tta1_group_decision(
+                        candidate_group,
+                        grouped_confidences[problem_index],
+                        threshold=tta1_threshold,
+                    )["accepted"]
+                ]
+                if not active_indices:
+                    break
+
+                additional_samples = min(2, max_samples - current_samples)
+                stage_index += 1
+                print(
+                    f"{round_name}: TTA-1 adding {additional_samples} rollouts "
+                    f"for {len(active_indices)} unresolved problems "
+                    f"(stage {stage_index}, cap {max_samples})...",
+                    flush=True,
+                )
+                additional_groups = _generate_indexed_problems(
+                    [
+                        (problem_index, problems[problem_index])
+                        for problem_index in active_indices
+                    ],
+                    sampling_models,
                     tokenizer,
-                    samples=samples,
+                    samples=additional_samples,
                     max_new_tokens=max_new_tokens,
                     generation_batch_size=generation_batch_size,
-                    progress_bar=sampling_progress,
+                    progress=progress,
+                    label=f"{round_name} TTA-1 sampling {stage_index}",
                 )
-                worker_results = [indexed_groups]
-            else:
-                with ThreadPoolExecutor(
-                    max_workers=len(problem_shards)
-                ) as executor:
-                    futures = [
-                        executor.submit(
-                            _generate_problem_shard,
-                            shard,
-                            sampling_model,
-                            tokenizer,
-                            samples=samples,
-                            max_new_tokens=max_new_tokens,
-                            generation_batch_size=generation_batch_size,
-                            progress_bar=sampling_progress,
-                        )
-                        for shard, sampling_model in zip(
-                            problem_shards,
-                            sampling_models,
-                            strict=True,
-                        )
-                    ]
-                    worker_results = [
-                        future.result()
-                        for future in futures
-                    ]
+                for problem_index, candidate_group in additional_groups.items():
+                    grouped_candidates[problem_index].extend(candidate_group)
+                score_candidate_groups(
+                    additional_groups,
+                    label=f"{round_name} TTA-1 scoring {stage_index}",
+                    calculate_confidence=True,
+                )
+                current_samples += additional_samples
 
-        for worker_result in worker_results:
-            for problem_index, candidate_group in worker_result:
-                grouped_candidates[problem_index] = candidate_group
-        if any(group is None for group in grouped_candidates):
-            raise RuntimeError("parallel sampling did not return every problem")
         candidates = [
             candidate
             for group in grouped_candidates
-            if group is not None
             for candidate in group
         ]
+        old_logprobs = [
+            row
+            for group in grouped_old_logprobs
+            for row in group
+        ]
+        token_self_certainties: list[float] | None = (
+            [
+                confidence
+                for group in grouped_confidences
+                for confidence in group
+            ]
+            if sampling_policy == "tta-1"
+            else None
+        )
 
         verified = (
             verify_candidates(problems, candidates)
             if reward_mode == "verifier"
             else None
         )
-        print(f"{round_name}: scoring old-policy token probabilities...", flush=True)
-        old_logprobs = _score_old_policy(
-            candidates,
-            model,
-            tokenizer,
-            torch,
-            device,
-            label=f"{round_name} scoring",
-            batch_size=batch_size,
-            max_length=max_length,
-            progress=progress,
-        )
+        if sampling_policy == "fixed":
+            print(f"{round_name}: scoring old-policy token probabilities...", flush=True)
+            old_logprobs, _ = _score_old_policy(
+                candidates,
+                model,
+                tokenizer,
+                torch,
+                device,
+                label=f"{round_name} scoring",
+                batch_size=batch_size,
+                max_length=max_length,
+                progress=progress,
+            )
         pseudo_label_groups: list[dict[str, object]] = []
         if verified is not None:
             rewards = [1.0 if item.is_correct else 0.0 for item in verified]
             metrics: dict[str, object] = {
                 **verification_metrics(verified),
+            }
+        elif sampling_policy == "tta-1":
+            if token_self_certainties is None:
+                raise RuntimeError("TTA-1 did not compute rollout confidence")
+            rewards, pseudo_label_groups = _assign_tta1_rewards(
+                candidates,
+                token_self_certainties,
+                threshold=tta1_threshold,
+            )
+            metrics = {
+                **_pseudo_label_metrics(
+                    candidates,
+                    rewards,
+                    pseudo_label_groups,
+                ),
+                "extended_groups": sum(
+                    int(record["sample_count"]) > samples
+                    for record in pseudo_label_groups
+                ),
+                "confidence_conflict_groups": sum(
+                    bool(record["confidence_conflict"])
+                    for record in pseudo_label_groups
+                ),
+                "tta1_abstained_groups": sum(
+                    not bool(record["accepted"])
+                    for record in pseudo_label_groups
+                ),
+                "mean_samples_per_problem": len(candidates) / len(problems),
             }
         else:
             rewards, pseudo_label_groups = assign_pseudo_label_rewards(
@@ -805,12 +1211,16 @@ def run_grpo_training(
                 "round": round_index,
                 "mixed_reward_groups": mixed_groups,
                 "reward_mode": reward_mode,
+                "sampling_policy": sampling_policy,
                 "zero_advantage_rollouts": sum(
                     rollout.advantage == 0 for rollout in rollouts
                 ),
                 "clip_epsilon": clip_epsilon,
                 "tune_mode": tune_mode,
                 "min_consensus": min_consensus,
+                "tta1_threshold": (
+                    tta1_threshold if sampling_policy == "tta-1" else None
+                ),
             }
         )
 
@@ -826,8 +1236,13 @@ def run_grpo_training(
                     pseudo_label_record=pseudo_label_by_id.get(
                         rollout.candidate.id
                     ),
+                    token_self_certainty=(
+                        token_self_certainties[index]
+                        if token_self_certainties is not None
+                        else None
+                    ),
                 )
-                for rollout in rollouts
+                for index, rollout in enumerate(rollouts)
             ),
         )
         if verified is not None:
@@ -899,7 +1314,14 @@ def run_grpo_training(
                 "model": model_id,
                 "tune_mode": tune_mode,
                 "reward_mode": reward_mode,
+                "sampling_policy": sampling_policy,
                 "min_consensus": min_consensus,
+                "max_samples": (
+                    max_samples if sampling_policy == "tta-1" else None
+                ),
+                "tta1_threshold": (
+                    tta1_threshold if sampling_policy == "tta-1" else None
+                ),
                 "samples_per_problem": samples,
                 "generation_batch_size": generation_batch_size,
                 "sampling_devices": len(sampling_models),

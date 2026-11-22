@@ -121,6 +121,37 @@ class CliTests(unittest.TestCase):
         self.assertEqual(arguments.reward_mode, "pseudo-label")
         self.assertEqual(arguments.min_consensus, 0.75)
 
+    def test_grpo_tta1_options_reach_training(self) -> None:
+        with (
+            patch("math_tta.cli.load_problems", return_value=[Problem("q1", "question")]),
+            patch("math_tta.cli.run_grpo_training", return_value=[]) as train,
+            redirect_stdout(StringIO()),
+        ):
+            result = main(
+                [
+                    "grpo",
+                    "--input",
+                    "train.jsonl",
+                    "--output-dir",
+                    "output",
+                    "--reward-mode",
+                    "pseudo-label",
+                    "--sampling-policy",
+                    "tta-1",
+                    "--samples",
+                    "4",
+                    "--max-samples",
+                    "8",
+                    "--tta1-threshold",
+                    "0.8",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(train.call_args.kwargs["sampling_policy"], "tta-1")
+        self.assertEqual(train.call_args.kwargs["max_samples"], 8)
+        self.assertEqual(train.call_args.kwargs["tta1_threshold"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

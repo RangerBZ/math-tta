@@ -133,6 +133,24 @@ def _parser() -> argparse.ArgumentParser:
         default=1,
         help="number of visible CUDA GPUs to use for parallel rollout sampling",
     )
+    grpo.add_argument(
+        "--sampling-policy",
+        choices=("fixed", "tta-1"),
+        default="fixed",
+        help="fixed rollout count or adaptive confidence-conflict sampling",
+    )
+    grpo.add_argument(
+        "--max-samples",
+        type=int,
+        default=8,
+        help="TTA-1 rollout cap per problem",
+    )
+    grpo.add_argument(
+        "--tta1-threshold",
+        type=float,
+        default=0.8,
+        help="TTA-1 minimum count-consensus fraction",
+    )
     grpo.add_argument("--max-new-tokens", type=int, default=512)
     grpo.add_argument("--rounds", type=int, default=1)
     grpo.add_argument("--epochs", type=int, default=1)
@@ -322,6 +340,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 samples=arguments.samples,
                 generation_batch_size=arguments.generation_batch_size,
                 sampling_devices=arguments.sampling_devices,
+                sampling_policy=arguments.sampling_policy,
+                max_samples=arguments.max_samples,
+                tta1_threshold=arguments.tta1_threshold,
                 max_new_tokens=arguments.max_new_tokens,
                 rounds=arguments.rounds,
                 epochs=arguments.epochs,
