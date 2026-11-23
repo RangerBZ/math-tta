@@ -299,6 +299,34 @@ coverage. Because TTA-1 uses only rollout-derived signals, it can select a
 wrong pseudo-label; evaluate on the held-out test set only after fixing the
 policy and hyperparameters.
 
+### Audit fixed-6 and TTA-1 rollout groups
+
+After both training runs, compare each generated answer with its GSM8K
+training reference, inspect pseudo-label changes at the 4/6/8-rollout
+prefixes, and summarize the resulting binary rewards and group-relative
+advantages:
+
+```bash
+python -m math_tta.audit_rollouts \
+  --problems data/gsm8k_train.jsonl \
+  --fixed6-rollouts outputs/qwen3-fixed6-grpo/rollouts-round-01.jsonl \
+  --tta1-rollouts outputs/qwen3-tta1-grpo/rollouts-round-01.jsonl \
+  --initial-samples 4 \
+  --fixed-min-consensus 0.5 \
+  --tta1-threshold 0.8 \
+  --output-dir outputs/rollout-audit
+```
+
+Pass the **raw** `rollouts-round-NN.jsonl` files, not only the `score` command's
+verified output: TTA-1 auditing needs each rollout's saved
+`token_self_certainty` to reproduce its confidence-weighted decision. The
+report writes per-question files and a `summary.json` with rollout correctness,
+pseudo-label coverage/accuracy, label and reward changes, mixed-reward groups,
+and zero/nonzero advantages. Prefix-cohort metrics include only groups that
+reached that sample count; each prefix also reports cumulative policy state,
+retaining groups that stopped earlier. Ground-truth answers are used only for
+this offline audit; they do not affect either run's rewards.
+
 Unparseable generations count as failed attempts. In verifier mode, answer
 agreement does not decide which traces train the model; the reference-answer
 verifier does. In pseudo-label mode, normalized within-group answer agreement
