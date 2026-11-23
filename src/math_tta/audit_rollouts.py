@@ -24,7 +24,7 @@ from math_tta.rl_training import (
 )
 from math_tta.verification import normalize_reference_answer
 
-SamplingPolicy = Literal["fixed", "tta-1"]
+SamplingPolicy = Literal["fixed", "tta-1", "tta-2"]
 
 
 def _read_rollout_metadata(
@@ -90,7 +90,7 @@ def load_rollout_artifact(
             row,
             "token_self_certainty",
             path=path,
-            required=policy == "tta-1",
+            required=policy in {"tta-1", "tta-2"},
         )
         if confidence is not None and not 0.0 <= confidence <= 1.0:
             raise ValueError(f"{path}: token_self_certainty must be in [0, 1]")
@@ -188,20 +188,30 @@ def _prefix_state(
             str,
         ):
             raise RuntimeError("TTA-1 returned an invalid confidence winner")
+        decision_consensus = decision["consensus"]
+        if isinstance(decision_consensus, bool) or not isinstance(
+            decision_consensus,
+            (int, float),
+        ):
+            raise RuntimeError("TTA-1 returned an invalid consensus")
         count_winner = decision_count_winner
         confidence_winner = decision_confidence_winner
-        consensus = float(decision["consensus"])
+        consensus = float(decision_consensus)
         accepted = bool(decision["accepted"])
         decision_reason = str(decision["decision_reason"])
         pseudo_answer = count_winner if accepted else None
-        rewards = [
-            float(
+        rewards = []
+        for index, candidate in enumerate(candidates):
+            answer = extract_answer(candidate.completion)
+            matches_pseudo_label = (
                 accepted
-                and (answer := extract_answer(candidate.completion)) is not None
+                and answer is not None
                 and normalize_answer(answer) == count_winner
             )
-            for candidate in candidates
-        ]
+            reward = float(matches_pseudo_label)
+            if policy == "tta-2":
+                reward *= complete_confidences[index]
+            rewards.append(reward)
 
     advantages = group_relative_advantages(
         [candidate.id for candidate in candidates],
@@ -220,6 +230,8 @@ def _prefix_state(
             "advantages": advantages,
             "reward_zero_count": sum(reward == 0.0 for reward in rewards),
             "reward_one_count": sum(reward == 1.0 for reward in rewards),
+            "reward_positive_count": sum(reward > 0.0 for reward in rewards),
+            "mean_reward": sum(rewards) / len(rewards),
             "mixed_rewards": min(rewards) != max(rewards),
             "advantage_zero_count": sum(value == 0.0 for value in advantages),
             "advantage_negative_count": sum(value < 0.0 for value in advantages),
@@ -293,8 +305,8 @@ def audit_rollouts(
     tta1_threshold: float = 0.8,
     sample_increment: int = 2,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if policy not in {"fixed", "tta-1"}:
-        raise ValueError("policy must be 'fixed' or 'tta-1'")
+    if policy not in {"fixed", "tta-1", "tta-2"}:
+        raise ValueError("policy must be 'fixed', 'tta-1', or 'tta-2'")
     if initial_samples < 1 or sample_increment < 1:
         raise ValueError("initial_samples and sample_increment must be positive")
     if not 0.0 < fixed_min_consensus <= 1.0:
@@ -536,6 +548,8 @@ def _summarize_checkpoint(
         "new_rollout_accuracy": added_correct / added_count if added_count else None,
         "reward_zero_count": sum(reward == 0.0 for reward in rewards),
         "reward_one_count": sum(reward == 1.0 for reward in rewards),
+        "reward_positive_count": sum(reward > 0.0 for reward in rewards),
+        "mean_reward": sum(rewards) / len(rewards) if rewards else 0.0,
         "mixed_reward_groups": sum(state["mixed_rewards"] for state in states),
         "zero_advantage_groups": sum(
             state["advantage_zero_count"] == state["sample_count"]
@@ -598,6 +612,14 @@ def _summarize_checkpoint(
             "reward_one_count": sum(
                 reward == 1.0 for reward in cumulative_rewards
             ),
+            "reward_positive_count": sum(
+                reward > 0.0 for reward in cumulative_rewards
+            ),
+            "mean_reward": (
+                sum(cumulative_rewards) / len(cumulative_rewards)
+                if cumulative_rewards
+                else 0.0
+            ),
             "mixed_reward_groups": sum(
                 state["mixed_rewards"] for state in cumulative_states
             ),
@@ -614,6 +636,76 @@ def _summarize_checkpoint(
                 for state in cumulative_states
             ),
         },
+    }
+
+
+def _confidence_correctness_diagnostics(
+    details: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    samples = [
+        rollout
+        for detail in details
+        for rollout in detail["rollouts"]
+        if rollout["token_self_certainty"] is not None
+    ]
+    if not samples:
+        return {"available": False, "bins": []}
+
+    bins = []
+    for bin_index in range(5):
+        lower = bin_index / 5
+        upper = (bin_index + 1) / 5
+        members = [
+            rollout
+            for rollout in samples
+            if lower <= rollout["token_self_certainty"]
+            and (
+                rollout["token_self_certainty"] <= upper
+                if bin_index == 4
+                else rollout["token_self_certainty"] < upper
+            )
+        ]
+        correct_count = sum(
+            rollout["correct_vs_reference"] for rollout in members
+        )
+        bins.append(
+            {
+                "lower": lower,
+                "upper": upper,
+                "count": len(members),
+                "correct_count": correct_count,
+                "accuracy": correct_count / len(members) if members else None,
+                "mean_confidence": (
+                    sum(item["token_self_certainty"] for item in members)
+                    / len(members)
+                    if members
+                    else None
+                ),
+            }
+        )
+
+    correct_samples = [
+        item for item in samples if item["correct_vs_reference"]
+    ]
+    incorrect_samples = [
+        item for item in samples if not item["correct_vs_reference"]
+    ]
+    return {
+        "available": True,
+        "sample_count": len(samples),
+        "mean_confidence_correct": (
+            sum(item["token_self_certainty"] for item in correct_samples)
+            / len(correct_samples)
+            if correct_samples
+            else None
+        ),
+        "mean_confidence_incorrect": (
+            sum(item["token_self_certainty"] for item in incorrect_samples)
+            / len(incorrect_samples)
+            if incorrect_samples
+            else None
+        ),
+        "bins": bins,
     }
 
 
@@ -635,6 +727,13 @@ def _parser() -> argparse.ArgumentParser:
         "--tta1-rollouts",
         required=True,
         help="raw TTA-1 rollout JSONL",
+    )
+    parser.add_argument(
+        "--tta2-rollouts",
+        help=(
+            "optional raw TTA-2 rollout JSONL; omit to simulate TTA-2 rewards "
+            "on the TTA-1 rollouts"
+        ),
     )
     parser.add_argument("--initial-samples", type=int, default=4)
     parser.add_argument("--sample-increment", type=int, default=2)
@@ -679,9 +778,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_details[run_name] = details
             run_summaries[run_name] = summaries
             run_id_sets[run_name] = {str(record["id"]) for record in details}
+        tta2_path = arguments.tta2_rollouts or arguments.tta1_rollouts
+        tta2_candidates, tta2_confidences, tta2_rewards, tta2_advantages = (
+            load_rollout_artifact(tta2_path, policy="tta-2")
+        )
+        if arguments.tta2_rollouts is None:
+            tta2_rewards = [None] * len(tta2_candidates)
+            tta2_advantages = [None] * len(tta2_candidates)
+        tta2_details, tta2_summaries = audit_rollouts(
+            problems,
+            tta2_candidates,
+            policy="tta-2",
+            confidence_weights=tta2_confidences,
+            stored_rewards=tta2_rewards,
+            stored_advantages=tta2_advantages,
+            initial_samples=arguments.initial_samples,
+            fixed_min_consensus=arguments.fixed_min_consensus,
+            tta1_threshold=arguments.tta1_threshold,
+            sample_increment=arguments.sample_increment,
+        )
+        run_details["tta2"] = tta2_details
+        run_summaries["tta2"] = tta2_summaries
+        run_id_sets["tta2"] = {str(record["id"]) for record in tta2_details}
         if run_id_sets["fixed6"] != run_id_sets["tta1"]:
             raise ValueError(
                 "fixed-6 and TTA-1 rollout files must contain the same problem IDs"
+            )
+        if run_id_sets["tta1"] != run_id_sets["tta2"]:
+            raise ValueError(
+                "TTA-1 and TTA-2 rollout files must contain the same problem IDs"
             )
 
         output_dir = Path(arguments.output_dir)
@@ -697,6 +822,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "tta1_threshold": arguments.tta1_threshold,
             },
             "runs": run_summaries,
+            "confidence_correctness": {
+                run_name: _confidence_correctness_diagnostics(details)
+                for run_name, details in run_details.items()
+            },
         }
         with (output_dir / "summary.json").open("w", encoding="utf-8") as target:
             json.dump(summary, target, ensure_ascii=False, indent=2)

@@ -135,21 +135,24 @@ def _parser() -> argparse.ArgumentParser:
     )
     grpo.add_argument(
         "--sampling-policy",
-        choices=("fixed", "tta-1"),
+        choices=("fixed", "tta-1", "tta-2"),
         default="fixed",
-        help="fixed rollout count or adaptive confidence-conflict sampling",
+        help=(
+            "fixed rollouts, TTA-1 adaptive sampling, or TTA-2 adaptive sampling "
+            "with confidence-shaped pseudo-label rewards"
+        ),
     )
     grpo.add_argument(
         "--max-samples",
         type=int,
         default=8,
-        help="TTA-1 rollout cap per problem",
+        help="adaptive-policy rollout cap per problem",
     )
     grpo.add_argument(
         "--tta1-threshold",
         type=float,
         default=0.8,
-        help="TTA-1 minimum count-consensus fraction",
+        help="adaptive-policy minimum count-consensus fraction",
     )
     grpo.add_argument("--max-new-tokens", type=int, default=512)
     grpo.add_argument("--rounds", type=int, default=1)

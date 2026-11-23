@@ -123,7 +123,10 @@ class CliTests(unittest.TestCase):
 
     def test_grpo_tta1_options_reach_training(self) -> None:
         with (
-            patch("math_tta.cli.load_problems", return_value=[Problem("q1", "question")]),
+            patch(
+                "math_tta.cli.load_problems",
+                return_value=[Problem("q1", "question")],
+            ),
             patch("math_tta.cli.run_grpo_training", return_value=[]) as train,
             redirect_stdout(StringIO()),
         ):
@@ -151,6 +154,49 @@ class CliTests(unittest.TestCase):
         self.assertEqual(train.call_args.kwargs["sampling_policy"], "tta-1")
         self.assertEqual(train.call_args.kwargs["max_samples"], 8)
         self.assertEqual(train.call_args.kwargs["tta1_threshold"], 0.8)
+
+    def test_grpo_accepts_tta2_sampling_policy(self) -> None:
+        arguments = _parser().parse_args(
+            [
+                "grpo",
+                "--input",
+                "train.jsonl",
+                "--output-dir",
+                "output",
+                "--reward-mode",
+                "pseudo-label",
+                "--sampling-policy",
+                "tta-2",
+            ]
+        )
+
+        self.assertEqual(arguments.sampling_policy, "tta-2")
+
+    def test_grpo_forwards_tta2_sampling_policy(self) -> None:
+        with (
+            patch(
+                "math_tta.cli.load_problems",
+                return_value=[Problem("q1", "question")],
+            ),
+            patch("math_tta.cli.run_grpo_training", return_value=[]) as train,
+            redirect_stdout(StringIO()),
+        ):
+            result = main(
+                [
+                    "grpo",
+                    "--input",
+                    "train.jsonl",
+                    "--output-dir",
+                    "output",
+                    "--reward-mode",
+                    "pseudo-label",
+                    "--sampling-policy",
+                    "tta-2",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(train.call_args.kwargs["sampling_policy"], "tta-2")
 
 
 if __name__ == "__main__":

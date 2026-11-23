@@ -8,6 +8,7 @@ from math_tta.rl_training import (
     _generate_problem_shard,
     _partition_problems,
     _padded_old_logprob_rows,
+    _assign_tta2_rewards,
     assign_pseudo_label_rewards,
     group_relative_advantages,
     run_grpo_training,
@@ -217,6 +218,58 @@ class GrpoTests(unittest.TestCase):
         self.assertEqual(rewards, [1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
         self.assertTrue(groups[0]["accepted"])
 
+    def test_tta2_weights_accepted_pseudo_label_rewards_by_confidence(self) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}")
+            for _ in range(4)
+        ]
+        rewards, groups = _assign_tta2_rewards(
+            candidates,
+            [0.2, 0.4, 0.6, 0.8],
+            threshold=0.8,
+        )
+
+        self.assertEqual(rewards, [0.2, 0.4, 0.6, 0.8])
+        self.assertEqual(
+            groups[0]["reward_scheme"],
+            "pseudo_label_match_times_self_certainty",
+        )
+        self.assertNotEqual(
+            group_relative_advantages(["q1"] * 4, rewards),
+            [0.0] * 4,
+        )
+
+    def test_tta2_gives_zero_reward_to_rejected_groups_and_dissenters(self) -> None:
+        rejected = [
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{2}"),
+            Candidate("q1", "question", r"\boxed{3}"),
+        ]
+        rewards, groups = _assign_tta2_rewards(
+            rejected,
+            [0.7, 0.7, 0.6, 0.5],
+            threshold=0.8,
+        )
+        self.assertEqual(rewards, [0.0] * 4)
+        self.assertFalse(groups[0]["accepted"])
+
+        accepted = [
+            Candidate("q2", "another question", r"\boxed{1}"),
+            Candidate("q2", "another question", r"\boxed{1.0}"),
+            Candidate("q2", "another question", r"\boxed{1}"),
+            Candidate("q2", "another question", r"\boxed{2}"),
+            Candidate("q2", "another question", r"\boxed{1}"),
+            Candidate("q2", "another question", r"\boxed{1}"),
+        ]
+        rewards, groups = _assign_tta2_rewards(
+            accepted,
+            [0.3, 0.5, 0.4, 0.2, 0.6, 0.8],
+            threshold=0.8,
+        )
+        self.assertEqual(rewards, [0.3, 0.5, 0.4, 0.0, 0.6, 0.8])
+        self.assertTrue(groups[0]["accepted"])
+
     def test_tta1_confidence_uses_normalized_mean_token_entropy(self) -> None:
         self.assertEqual(_token_self_certainty(0.0, 100), 1.0)
         self.assertAlmostEqual(
@@ -285,6 +338,16 @@ class GrpoTests(unittest.TestCase):
                 sampling_policy="tta-1",
                 max_samples=3,
                 reward_mode="pseudo-label",
+            )
+
+    def test_tta2_requires_pseudo_label_rewards_before_loading_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires pseudo-label"):
+            run_grpo_training(
+                [Problem("train-00001", "question", "42")],
+                model_id="unused",
+                output_dir="unused",
+                sampling_policy="tta-2",
+                reward_mode="verifier",
             )
 
     def test_rejects_clip_epsilon_outside_open_unit_interval_before_model_load(

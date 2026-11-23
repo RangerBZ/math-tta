@@ -24,7 +24,7 @@ from math_tta.progress import load_tqdm
 from math_tta.verification import verify_candidates, verification_metrics
 
 RewardMode = Literal["verifier", "pseudo-label"]
-SamplingPolicy = Literal["fixed", "tta-1"]
+SamplingPolicy = Literal["fixed", "tta-1", "tta-2"]
 
 
 def _partition_problems(
@@ -242,6 +242,35 @@ def _assign_tta1_rewards(
     *,
     threshold: float,
 ) -> tuple[list[float], list[dict[str, object]]]:
+    return _assign_tta_rewards(
+        candidates,
+        confidence_weights,
+        threshold=threshold,
+        confidence_shaped=False,
+    )
+
+
+def _assign_tta2_rewards(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    *,
+    threshold: float,
+) -> tuple[list[float], list[dict[str, object]]]:
+    return _assign_tta_rewards(
+        candidates,
+        confidence_weights,
+        threshold=threshold,
+        confidence_shaped=True,
+    )
+
+
+def _assign_tta_rewards(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    *,
+    threshold: float,
+    confidence_shaped: bool,
+) -> tuple[list[float], list[dict[str, object]]]:
     if len(candidates) != len(confidence_weights):
         raise ValueError("each candidate must have one confidence weight")
     candidates_by_problem: dict[str, list[int]] = defaultdict(list)
@@ -265,11 +294,20 @@ def _assign_tta1_rewards(
         )
         count_winner = decision["count_winner"]
         if decision["accepted"]:
-            for index in indices:
+            for index, confidence in zip(
+                indices,
+                group_confidences,
+                strict=True,
+            ):
                 answer = extract_answer(candidates[index].completion)
-                rewards[index] = float(
+                matches_pseudo_label = (
                     answer is not None
                     and normalize_answer(answer) == count_winner
+                )
+                rewards[index] = (
+                    confidence * float(matches_pseudo_label)
+                    if confidence_shaped
+                    else float(matches_pseudo_label)
                 )
         records.append(
             {
@@ -285,6 +323,11 @@ def _assign_tta1_rewards(
                 "accepted": decision["accepted"],
                 "decision_reason": decision["decision_reason"],
                 "confidence_weights": group_confidences,
+                "reward_scheme": (
+                    "pseudo_label_match_times_self_certainty"
+                    if confidence_shaped
+                    else "binary_pseudo_label_match"
+                ),
             }
         )
     return rewards, records
@@ -391,6 +434,12 @@ def _pseudo_label_metrics(
     group_records: Sequence[dict[str, object]],
 ) -> dict[str, float | int]:
     accepted_groups = [record for record in group_records if record["accepted"]]
+    accepted_consensus: list[float] = []
+    for record in accepted_groups:
+        consensus = record["consensus"]
+        if isinstance(consensus, bool) or not isinstance(consensus, (int, float)):
+            raise RuntimeError("pseudo-label group has an invalid consensus")
+        accepted_consensus.append(float(consensus))
     parseable_samples = sum(
         extract_answer(candidate.completion) is not None
         for candidate in candidates
@@ -404,13 +453,19 @@ def _pseudo_label_metrics(
         "abstained_groups": len(group_records) - len(accepted_groups),
         "pseudo_label_coverage": len(accepted_groups) / len(group_records),
         "mean_accepted_consensus": (
-            sum(float(record["consensus"]) for record in accepted_groups)
-            / len(accepted_groups)
-            if accepted_groups
+            sum(accepted_consensus) / len(accepted_consensus)
+            if accepted_consensus
             else 0.0
         ),
         "pseudo_label_reward_rate": sum(rewards) / len(rewards),
     }
+
+
+def _record_sample_count(record: dict[str, object]) -> int:
+    sample_count = record["sample_count"]
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        raise RuntimeError("pseudo-label group has an invalid sample count")
+    return sample_count
 
 
 def _collate_candidates(
@@ -860,12 +915,15 @@ def run_grpo_training(
         )
     if reward_mode not in {"verifier", "pseudo-label"}:
         raise ValueError("reward_mode must be 'verifier' or 'pseudo-label'")
-    if sampling_policy not in {"fixed", "tta-1"}:
-        raise ValueError("sampling_policy must be 'fixed' or 'tta-1'")
-    if sampling_policy == "tta-1" and reward_mode != "pseudo-label":
-        raise ValueError("sampling_policy='tta-1' requires pseudo-label rewards")
-    if sampling_policy == "tta-1" and max_samples < samples:
-        raise ValueError("max_samples must be at least samples for TTA-1")
+    if sampling_policy not in {"fixed", "tta-1", "tta-2"}:
+        raise ValueError("sampling_policy must be 'fixed', 'tta-1', or 'tta-2'")
+    adaptive_sampling = sampling_policy in {"tta-1", "tta-2"}
+    if adaptive_sampling and reward_mode != "pseudo-label":
+        raise ValueError(
+            "sampling_policy='tta-1' or 'tta-2' requires pseudo-label rewards"
+        )
+    if adaptive_sampling and max_samples < samples:
+        raise ValueError("max_samples must be at least samples for TTA-1/TTA-2")
     if not 0.0 < tta1_threshold <= 1.0:
         raise ValueError("tta1_threshold must be in the interval (0, 1]")
     if reward_mode == "verifier" and any(
@@ -969,9 +1027,10 @@ def run_grpo_training(
         for replica in sampling_models[1:]:
             replica.load_state_dict(model.state_dict())
             replica.eval()
-        if sampling_policy == "tta-1":
+        if adaptive_sampling:
             print(
-                f"{round_name}: TTA-1 sampling {samples} initial rollouts for "
+                f"{round_name}: {sampling_policy.upper()} sampling "
+                f"{samples} initial rollouts for "
                 f"{len(problems)} problems (maximum {max_samples}) across "
                 f"{len(sampling_models)} sampling replica(s)...",
                 flush=True,
@@ -1045,10 +1104,10 @@ def run_grpo_training(
         for problem_index, candidate_group in initial_groups.items():
             grouped_candidates[problem_index].extend(candidate_group)
 
-        if sampling_policy == "tta-1":
+        if adaptive_sampling:
             score_candidate_groups(
                 initial_groups,
-                label=f"{round_name} TTA-1 confidence scoring",
+                label=f"{round_name} {sampling_policy.upper()} confidence scoring",
                 calculate_confidence=True,
             )
             current_samples = samples
@@ -1071,7 +1130,8 @@ def run_grpo_training(
                 additional_samples = min(2, max_samples - current_samples)
                 stage_index += 1
                 print(
-                    f"{round_name}: TTA-1 adding {additional_samples} rollouts "
+                    f"{round_name}: {sampling_policy.upper()} adding "
+                    f"{additional_samples} rollouts "
                     f"for {len(active_indices)} unresolved problems "
                     f"(stage {stage_index}, cap {max_samples})...",
                     flush=True,
@@ -1087,13 +1147,19 @@ def run_grpo_training(
                     max_new_tokens=max_new_tokens,
                     generation_batch_size=generation_batch_size,
                     progress=progress,
-                    label=f"{round_name} TTA-1 sampling {stage_index}",
+                    label=(
+                        f"{round_name} {sampling_policy.upper()} sampling "
+                        f"{stage_index}"
+                    ),
                 )
                 for problem_index, candidate_group in additional_groups.items():
                     grouped_candidates[problem_index].extend(candidate_group)
                 score_candidate_groups(
                     additional_groups,
-                    label=f"{round_name} TTA-1 scoring {stage_index}",
+                    label=(
+                        f"{round_name} {sampling_policy.upper()} scoring "
+                        f"{stage_index}"
+                    ),
                     calculate_confidence=True,
                 )
                 current_samples += additional_samples
@@ -1114,7 +1180,7 @@ def run_grpo_training(
                 for group in grouped_confidences
                 for confidence in group
             ]
-            if sampling_policy == "tta-1"
+            if adaptive_sampling
             else None
         )
 
@@ -1142,10 +1208,15 @@ def run_grpo_training(
             metrics: dict[str, object] = {
                 **verification_metrics(verified),
             }
-        elif sampling_policy == "tta-1":
+        elif adaptive_sampling:
             if token_self_certainties is None:
-                raise RuntimeError("TTA-1 did not compute rollout confidence")
-            rewards, pseudo_label_groups = _assign_tta1_rewards(
+                raise RuntimeError("adaptive sampling did not compute confidence")
+            assign_rewards = (
+                _assign_tta2_rewards
+                if sampling_policy == "tta-2"
+                else _assign_tta1_rewards
+            )
+            rewards, pseudo_label_groups = assign_rewards(
                 candidates,
                 token_self_certainties,
                 threshold=tta1_threshold,
@@ -1157,18 +1228,41 @@ def run_grpo_training(
                     pseudo_label_groups,
                 ),
                 "extended_groups": sum(
-                    int(record["sample_count"]) > samples
+                    _record_sample_count(record) > samples
                     for record in pseudo_label_groups
                 ),
                 "confidence_conflict_groups": sum(
                     bool(record["confidence_conflict"])
                     for record in pseudo_label_groups
                 ),
-                "tta1_abstained_groups": sum(
+                "adaptive_abstained_groups": sum(
                     not bool(record["accepted"])
                     for record in pseudo_label_groups
                 ),
+                "tta1_abstained_groups": (
+                    sum(
+                        not bool(record["accepted"])
+                        for record in pseudo_label_groups
+                    )
+                    if sampling_policy == "tta-1"
+                    else None
+                ),
                 "mean_samples_per_problem": len(candidates) / len(problems),
+                "reward_scheme": (
+                    "pseudo_label_match_times_self_certainty"
+                    if sampling_policy == "tta-2"
+                    else "binary_pseudo_label_match"
+                ),
+                "mean_confidence_shaped_reward": (
+                    sum(rewards) / len(rewards)
+                    if sampling_policy == "tta-2"
+                    else None
+                ),
+                "pseudo_label_reward_rate": (
+                    sum(reward > 0.0 for reward in rewards) / len(rewards)
+                    if sampling_policy == "tta-2"
+                    else sum(rewards) / len(rewards)
+                ),
             }
         else:
             rewards, pseudo_label_groups = assign_pseudo_label_rewards(
@@ -1219,7 +1313,7 @@ def run_grpo_training(
                 "tune_mode": tune_mode,
                 "min_consensus": min_consensus,
                 "tta1_threshold": (
-                    tta1_threshold if sampling_policy == "tta-1" else None
+                    tta1_threshold if adaptive_sampling else None
                 ),
             }
         )
@@ -1317,10 +1411,10 @@ def run_grpo_training(
                 "sampling_policy": sampling_policy,
                 "min_consensus": min_consensus,
                 "max_samples": (
-                    max_samples if sampling_policy == "tta-1" else None
+                    max_samples if adaptive_sampling else None
                 ),
                 "tta1_threshold": (
-                    tta1_threshold if sampling_policy == "tta-1" else None
+                    tta1_threshold if adaptive_sampling else None
                 ),
                 "samples_per_problem": samples,
                 "generation_batch_size": generation_batch_size,

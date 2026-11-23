@@ -1,7 +1,16 @@
+from contextlib import redirect_stdout
+from io import StringIO
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
-from math_tta.audit_rollouts import audit_rollouts
-from math_tta.data import Candidate, Problem
+from math_tta.audit_rollouts import (
+    _confidence_correctness_diagnostics,
+    audit_rollouts,
+    main,
+)
+from math_tta.data import Candidate, Problem, write_jsonl
 from math_tta.rl_training import group_relative_advantages
 
 
@@ -73,6 +82,35 @@ class RolloutAuditTests(unittest.TestCase):
         self.assertEqual(summaries[-1]["nonzero_advantage_rollouts"], 6)
         self.assertEqual(summaries[-1]["cumulative"]["accepted_groups"], 1)
 
+    def test_tta2_audit_simulates_confidence_shaped_rewards(self) -> None:
+        problem = Problem("q1", "question", "rationale #### 1")
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}")
+            for _ in range(4)
+        ]
+        details, summaries = audit_rollouts(
+            [problem],
+            candidates,
+            policy="tta-2",
+            confidence_weights=[0.2, 0.4, 0.6, 0.8],
+            stored_rewards=[None] * 4,
+            stored_advantages=[None] * 4,
+            initial_samples=4,
+        )
+
+        prefix = details[0]["prefixes"][0]
+        self.assertEqual(prefix["rewards"], [0.2, 0.4, 0.6, 0.8])
+        self.assertEqual(prefix["advantage_zero_count"], 0)
+        self.assertEqual(summaries[0]["reward_positive_count"], 4)
+        self.assertEqual(summaries[0]["mixed_reward_groups"], 1)
+        confidence_report = _confidence_correctness_diagnostics(details)
+        self.assertEqual(confidence_report["sample_count"], 4)
+        self.assertEqual(confidence_report["mean_confidence_correct"], 0.5)
+        self.assertEqual(
+            sum(bucket["count"] for bucket in confidence_report["bins"]),
+            4,
+        )
+
     def test_audit_rejects_noncontiguous_rollout_groups(self) -> None:
         problems = [
             Problem("q1", "question 1", "#### 1"),
@@ -93,6 +131,72 @@ class RolloutAuditTests(unittest.TestCase):
                 stored_rewards=[None] * 3,
                 stored_advantages=[None] * 3,
                 initial_samples=1,
+            )
+
+    def test_audit_cli_simulates_tta2_rewards_from_tta1_rollouts(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            problems_path = root / "problems.jsonl"
+            fixed_path = root / "fixed6.jsonl"
+            tta1_path = root / "tta1.jsonl"
+            output_dir = root / "audit"
+
+            write_jsonl(
+                problems_path,
+                [{"id": "q1", "question": "question", "answer": "#### 1"}],
+            )
+            completions = [r"\boxed{1}"] * 6
+            write_jsonl(
+                fixed_path,
+                (
+                    {
+                        "id": "q1",
+                        "question": "question",
+                        "completion": completion,
+                        "reward": 1.0,
+                        "advantage": 0.0,
+                    }
+                    for completion in completions
+                ),
+            )
+            write_jsonl(
+                tta1_path,
+                (
+                    {
+                        "id": "q1",
+                        "question": "question",
+                        "completion": r"\boxed{1}",
+                        "token_self_certainty": confidence,
+                        "reward": 1.0,
+                        "advantage": 0.0,
+                    }
+                    for confidence in (0.2, 0.4, 0.6, 0.8)
+                ),
+            )
+
+            with redirect_stdout(StringIO()):
+                result = main(
+                    [
+                        "--problems",
+                        str(problems_path),
+                        "--fixed6-rollouts",
+                        str(fixed_path),
+                        "--tta1-rollouts",
+                        str(tta1_path),
+                        "--output-dir",
+                        str(output_dir),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            summary = json.loads((output_dir / "summary.json").read_text())
+            self.assertEqual(
+                summary["runs"]["tta2"][0]["nonzero_advantage_rollouts"],
+                4,
+            )
+            self.assertEqual(
+                summary["confidence_correctness"]["tta2"]["sample_count"],
+                4,
             )
 
 

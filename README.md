@@ -299,6 +299,64 @@ coverage. Because TTA-1 uses only rollout-derived signals, it can select a
 wrong pseudo-label; evaluate on the held-out test set only after fixing the
 policy and hyperparameters.
 
+### TTA-2 confidence-shaped rewards
+
+TTA-2 uses the same adaptive sampling, confidence/count-winner agreement, and
+abstention decisions as TTA-1. It changes only reward allocation: for an
+accepted group, a rollout matching the pseudo-label receives its saved
+`token_self_certainty` in `[0, 1]`; dissenting or unaccepted rollouts receive
+zero. This can create within-group GRPO advantages even when every sampled
+answer agrees, provided their confidence scores differ. If all rewards in a
+group are still equal, the group has zero relative advantage and is skipped.
+Confidence is an uncalibrated self-certainty signal, not answer correctness;
+TTA-2 can emphasize a confidently wrong pseudo-label.
+
+Run TTA-2 with the same sampling controls as TTA-1:
+
+```bash
+python -m math_tta.cli grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-tta2-grpo \
+  --model Qwen/Qwen3-0.6B \
+  --reward-mode pseudo-label \
+  --sampling-policy tta-2 \
+  --samples 4 \
+  --max-samples 8 \
+  --tta1-threshold 0.8 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
+
+### Offline confidence/reward check
+
+The rollout audit simulates TTA-2 rewards on the TTA-1 samples by default and
+reports confidence-versus-training-answer accuracy bins alongside reward and
+advantage distributions. This reuses the saved trajectories, so it checks the
+reward mechanics without another sampling run or model update:
+
+```bash
+python -m math_tta.audit_rollouts \
+  --problems data/gsm8k_train.jsonl \
+  --fixed6-rollouts outputs/qwen3-fixed6-grpo/rollouts-round-01.jsonl \
+  --tta1-rollouts outputs/qwen3-tta1-grpo/rollouts-round-01.jsonl \
+  --initial-samples 4 \
+  --fixed-min-consensus 0.5 \
+  --tta1-threshold 0.8 \
+  --output-dir outputs/rollout-audit
+```
+
+Optionally pass `--tta2-rollouts` with the actual TTA-2 rollout artifact to
+check that recomputed TTA-2 rewards and advantages match the saved values.
+The confidence/correctness relationship is diagnostic only: training answers
+are not used by the TTA-2 reward.
+
 ### Audit fixed-6 and TTA-1 rollout groups
 
 After both training runs, compare each generated answer with its GSM8K
@@ -318,7 +376,7 @@ python -m math_tta.audit_rollouts \
 ```
 
 Pass the **raw** `rollouts-round-NN.jsonl` files, not only the `score` command's
-verified output: TTA-1 auditing needs each rollout's saved
+verified output: adaptive-policy auditing needs each rollout's saved
 `token_self_certainty` to reproduce its confidence-weighted decision. The
 report writes per-question files and a `summary.json` with rollout correctness,
 pseudo-label coverage/accuracy, label and reward changes, mixed-reward groups,
