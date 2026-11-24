@@ -24,7 +24,9 @@ from math_tta.progress import load_tqdm
 from math_tta.verification import verify_candidates, verification_metrics
 
 RewardMode = Literal["verifier", "pseudo-label"]
-SamplingPolicy = Literal["fixed", "tta-1", "tta-2"]
+SamplingPolicy = Literal["fixed", "tta-1", "tta-2", "tta-3"]
+_BAYESIAN_CONFIDENCE_BINS = 20
+_BAYESIAN_CALIBRATION_FOLDS = 5
 
 
 def _partition_problems(
@@ -264,15 +266,38 @@ def _assign_tta2_rewards(
     )
 
 
+def _assign_tta3_rewards(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    calibrated_confidences: Sequence[float],
+    *,
+    threshold: float,
+) -> tuple[list[float], list[dict[str, object]]]:
+    if len(candidates) != len(calibrated_confidences):
+        raise ValueError("each candidate must have one calibrated confidence")
+    return _assign_tta_rewards(
+        candidates,
+        confidence_weights,
+        threshold=threshold,
+        confidence_shaped=False,
+        reward_weights=calibrated_confidences,
+        reward_scheme="pseudo_label_match_times_bayesian_correctness_posterior",
+    )
+
+
 def _assign_tta_rewards(
     candidates: Sequence[Candidate],
     confidence_weights: Sequence[float],
     *,
     threshold: float,
     confidence_shaped: bool,
+    reward_weights: Sequence[float] | None = None,
+    reward_scheme: str | None = None,
 ) -> tuple[list[float], list[dict[str, object]]]:
     if len(candidates) != len(confidence_weights):
         raise ValueError("each candidate must have one confidence weight")
+    if reward_weights is not None and len(candidates) != len(reward_weights):
+        raise ValueError("each candidate must have one reward weight")
     candidates_by_problem: dict[str, list[int]] = defaultdict(list)
     for index, candidate in enumerate(candidates):
         candidates_by_problem[candidate.id].append(index)
@@ -305,32 +330,112 @@ def _assign_tta_rewards(
                     and normalize_answer(answer) == count_winner
                 )
                 rewards[index] = (
-                    confidence * float(matches_pseudo_label)
-                    if confidence_shaped
+                    (
+                        reward_weights[index]
+                        if reward_weights is not None
+                        else confidence
+                    )
+                    * float(matches_pseudo_label)
+                    if confidence_shaped or reward_weights is not None
                     else float(matches_pseudo_label)
                 )
-        records.append(
-            {
-                "id": problem_id,
-                "question": group_candidates[0].question,
-                "pseudo_answer": count_winner if decision["accepted"] else None,
-                "count_winner": count_winner,
-                "confidence_winner": decision["confidence_winner"],
-                "consensus": decision["consensus"],
-                "sample_count": decision["sample_count"],
-                "parseable_samples": decision["parseable_samples"],
-                "confidence_conflict": decision["confidence_conflict"],
-                "accepted": decision["accepted"],
-                "decision_reason": decision["decision_reason"],
-                "confidence_weights": group_confidences,
-                "reward_scheme": (
-                    "pseudo_label_match_times_self_certainty"
-                    if confidence_shaped
-                    else "binary_pseudo_label_match"
-                ),
-            }
-        )
+        group_record: dict[str, object] = {
+            "id": problem_id,
+            "question": group_candidates[0].question,
+            "pseudo_answer": count_winner if decision["accepted"] else None,
+            "count_winner": count_winner,
+            "confidence_winner": decision["confidence_winner"],
+            "consensus": decision["consensus"],
+            "sample_count": decision["sample_count"],
+            "parseable_samples": decision["parseable_samples"],
+            "confidence_conflict": decision["confidence_conflict"],
+            "accepted": decision["accepted"],
+            "decision_reason": decision["decision_reason"],
+            "confidence_weights": group_confidences,
+            "reward_scheme": reward_scheme
+            or (
+                "pseudo_label_match_times_self_certainty"
+                if confidence_shaped
+                else "binary_pseudo_label_match"
+            ),
+        }
+        if reward_weights is not None:
+            group_record["calibrated_confidence_weights"] = [
+                reward_weights[index] for index in indices
+            ]
+            group_record["reward_scheme"] = reward_scheme or (
+                "pseudo_label_match_times_self_certainty"
+            )
+        records.append(group_record)
     return rewards, records
+
+
+def _bayesian_calibrated_confidence(
+    group_ids: Sequence[str],
+    confidence_weights: Sequence[float],
+    correctness: Sequence[bool],
+) -> list[float]:
+    if not group_ids:
+        raise ValueError("Bayesian confidence calibration requires rollouts")
+    if len(group_ids) != len(confidence_weights) or len(group_ids) != len(
+        correctness
+    ):
+        raise ValueError("calibration inputs must have equal lengths")
+    if len(set(group_ids)) < 2:
+        return [0.5] * len(group_ids)
+    if any(not isinstance(value, bool) for value in correctness):
+        raise ValueError("correctness labels must be booleans")
+    if any(
+        not isfinite(confidence) or not 0.0 <= confidence <= 1.0
+        for confidence in confidence_weights
+    ):
+        raise ValueError("confidence weights must be finite values in [0, 1]")
+
+    problem_ids = sorted(set(group_ids))
+    fold_count = min(_BAYESIAN_CALIBRATION_FOLDS, len(problem_ids))
+    fold_by_problem = {
+        problem_id: index % fold_count
+        for index, problem_id in enumerate(problem_ids)
+    }
+    bin_indices = [
+        min(int(confidence * _BAYESIAN_CONFIDENCE_BINS), _BAYESIAN_CONFIDENCE_BINS - 1)
+        for confidence in confidence_weights
+    ]
+    calibrated = [0.0] * len(group_ids)
+    for fold in range(fold_count):
+        correct_counts = [0] * _BAYESIAN_CONFIDENCE_BINS
+        sample_counts = [0] * _BAYESIAN_CONFIDENCE_BINS
+        held_out_indices: list[int] = []
+        for index, problem_id in enumerate(group_ids):
+            bin_index = bin_indices[index]
+            if fold_by_problem[problem_id] == fold:
+                held_out_indices.append(index)
+                continue
+            sample_counts[bin_index] += 1
+            correct_counts[bin_index] += int(correctness[index])
+        posterior_means = [
+            (1 + correct_count) / (2 + sample_count)
+            for correct_count, sample_count in zip(
+                correct_counts,
+                sample_counts,
+                strict=True,
+            )
+        ]
+        last_bin = _BAYESIAN_CONFIDENCE_BINS - 1
+        for index in held_out_indices:
+            position = confidence_weights[index] * _BAYESIAN_CONFIDENCE_BINS - 0.5
+            lower_bin = int(position)
+            if position <= 0:
+                calibrated[index] = posterior_means[0]
+            elif position >= last_bin:
+                calibrated[index] = posterior_means[last_bin]
+            else:
+                fraction = position - lower_bin
+                calibrated[index] = (
+                    posterior_means[lower_bin] * (1 - fraction)
+                    + posterior_means[lower_bin + 1] * fraction
+                )
+    return calibrated
 
 
 def group_relative_advantages(
@@ -847,6 +952,7 @@ def _rollout_record(
     reward_mode: RewardMode,
     pseudo_label_record: dict[str, object] | None = None,
     token_self_certainty: float | None = None,
+    bayesian_correctness_probability: float | None = None,
 ) -> dict[str, object]:
     candidate = rollout.candidate
     record: dict[str, object] = {
@@ -862,6 +968,10 @@ def _rollout_record(
     }
     if token_self_certainty is not None:
         record["token_self_certainty"] = token_self_certainty
+    if bayesian_correctness_probability is not None:
+        record["bayesian_correctness_probability"] = (
+            bayesian_correctness_probability
+        )
     if pseudo_label_record is not None:
         record.update(
             {
@@ -915,15 +1025,26 @@ def run_grpo_training(
         )
     if reward_mode not in {"verifier", "pseudo-label"}:
         raise ValueError("reward_mode must be 'verifier' or 'pseudo-label'")
-    if sampling_policy not in {"fixed", "tta-1", "tta-2"}:
-        raise ValueError("sampling_policy must be 'fixed', 'tta-1', or 'tta-2'")
-    adaptive_sampling = sampling_policy in {"tta-1", "tta-2"}
+    if sampling_policy not in {"fixed", "tta-1", "tta-2", "tta-3"}:
+        raise ValueError(
+            "sampling_policy must be 'fixed', 'tta-1', 'tta-2', or 'tta-3'"
+        )
+    adaptive_sampling = sampling_policy in {"tta-1", "tta-2", "tta-3"}
     if adaptive_sampling and reward_mode != "pseudo-label":
         raise ValueError(
-            "sampling_policy='tta-1' or 'tta-2' requires pseudo-label rewards"
+            f"sampling_policy={sampling_policy!r} requires pseudo-label rewards"
+        )
+    if sampling_policy == "tta-3" and len(problems) < 2:
+        raise ValueError("sampling_policy='tta-3' requires at least two problems")
+    if sampling_policy == "tta-3" and any(
+        problem.answer is None or not problem.answer.strip()
+        for problem in problems
+    ):
+        raise ValueError(
+            "sampling_policy='tta-3' requires reference answers for calibration"
         )
     if adaptive_sampling and max_samples < samples:
-        raise ValueError("max_samples must be at least samples for TTA-1/TTA-2")
+        raise ValueError("max_samples must be at least samples for adaptive policies")
     if not 0.0 < tta1_threshold <= 1.0:
         raise ValueError("tta1_threshold must be in the interval (0, 1]")
     if reward_mode == "verifier" and any(
@@ -1183,10 +1304,11 @@ def run_grpo_training(
             if adaptive_sampling
             else None
         )
+        bayesian_confidences: list[float] | None = None
 
         verified = (
             verify_candidates(problems, candidates)
-            if reward_mode == "verifier"
+            if reward_mode == "verifier" or sampling_policy == "tta-3"
             else None
         )
         if sampling_policy == "fixed":
@@ -1203,7 +1325,7 @@ def run_grpo_training(
                 progress=progress,
             )
         pseudo_label_groups: list[dict[str, object]] = []
-        if verified is not None:
+        if reward_mode == "verifier" and verified is not None:
             rewards = [1.0 if item.is_correct else 0.0 for item in verified]
             metrics: dict[str, object] = {
                 **verification_metrics(verified),
@@ -1211,16 +1333,31 @@ def run_grpo_training(
         elif adaptive_sampling:
             if token_self_certainties is None:
                 raise RuntimeError("adaptive sampling did not compute confidence")
-            assign_rewards = (
-                _assign_tta2_rewards
-                if sampling_policy == "tta-2"
-                else _assign_tta1_rewards
-            )
-            rewards, pseudo_label_groups = assign_rewards(
-                candidates,
-                token_self_certainties,
-                threshold=tta1_threshold,
-            )
+            if sampling_policy == "tta-3":
+                if verified is None:
+                    raise RuntimeError("TTA-3 did not verify calibration rollouts")
+                bayesian_confidences = _bayesian_calibrated_confidence(
+                    [candidate.id for candidate in candidates],
+                    token_self_certainties,
+                    [item.is_correct for item in verified],
+                )
+                rewards, pseudo_label_groups = _assign_tta3_rewards(
+                    candidates,
+                    token_self_certainties,
+                    bayesian_confidences,
+                    threshold=tta1_threshold,
+                )
+            else:
+                assign_rewards = (
+                    _assign_tta2_rewards
+                    if sampling_policy == "tta-2"
+                    else _assign_tta1_rewards
+                )
+                rewards, pseudo_label_groups = assign_rewards(
+                    candidates,
+                    token_self_certainties,
+                    threshold=tta1_threshold,
+                )
             metrics = {
                 **_pseudo_label_metrics(
                     candidates,
@@ -1248,19 +1385,25 @@ def run_grpo_training(
                     else None
                 ),
                 "mean_samples_per_problem": len(candidates) / len(problems),
-                "reward_scheme": (
-                    "pseudo_label_match_times_self_certainty"
-                    if sampling_policy == "tta-2"
-                    else "binary_pseudo_label_match"
-                ),
+                "reward_scheme": str(pseudo_label_groups[0]["reward_scheme"]),
                 "mean_confidence_shaped_reward": (
                     sum(rewards) / len(rewards)
                     if sampling_policy == "tta-2"
                     else None
                 ),
+                "mean_bayesian_reward": (
+                    sum(rewards) / len(rewards)
+                    if sampling_policy == "tta-3"
+                    else None
+                ),
+                "mean_bayesian_correctness_probability": (
+                    sum(bayesian_confidences) / len(bayesian_confidences)
+                    if bayesian_confidences is not None
+                    else None
+                ),
                 "pseudo_label_reward_rate": (
                     sum(reward > 0.0 for reward in rewards) / len(rewards)
-                    if sampling_policy == "tta-2"
+                    if sampling_policy in {"tta-2", "tta-3"}
                     else sum(rewards) / len(rewards)
                 ),
             }
@@ -1333,6 +1476,11 @@ def run_grpo_training(
                     token_self_certainty=(
                         token_self_certainties[index]
                         if token_self_certainties is not None
+                        else None
+                    ),
+                    bayesian_correctness_probability=(
+                        bayesian_confidences[index]
+                        if bayesian_confidences is not None
                         else None
                     ),
                 )

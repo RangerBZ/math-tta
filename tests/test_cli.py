@@ -198,6 +198,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(train.call_args.kwargs["sampling_policy"], "tta-2")
 
+    def test_grpo_accepts_and_forwards_tta3_sampling_policy(self) -> None:
+        arguments = _parser().parse_args(
+            [
+                "grpo",
+                "--input",
+                "train.jsonl",
+                "--output-dir",
+                "output",
+                "--reward-mode",
+                "pseudo-label",
+                "--sampling-policy",
+                "tta-3",
+            ]
+        )
+        self.assertEqual(arguments.sampling_policy, "tta-3")
+
+        with (
+            patch(
+                "math_tta.cli.load_problems",
+                return_value=[Problem("q1", "question", "#### 1")],
+            ),
+            patch("math_tta.cli.run_grpo_training", return_value=[]) as train,
+            redirect_stdout(StringIO()),
+        ):
+            result = main(
+                [
+                    "grpo",
+                    "--input",
+                    "train.jsonl",
+                    "--output-dir",
+                    "output",
+                    "--reward-mode",
+                    "pseudo-label",
+                    "--sampling-policy",
+                    "tta-3",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(train.call_args.kwargs["sampling_policy"], "tta-3")
+
 
 if __name__ == "__main__":
     unittest.main()

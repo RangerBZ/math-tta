@@ -334,18 +334,57 @@ python -m math_tta.cli grpo \
   --seed 42
 ```
 
+### TTA-3 Bayesian-calibrated confidence rewards
+
+TTA-3 preserves TTA-1/TTA-2 sampling and acceptance. It uses each rollout's
+known training-answer correctness only to calibrate self-certainty, not as the
+rollout's direct reward. For each of 20 equal-width confidence bins, a
+Beta(1,1) prior is updated with rollout correctness from other question-level
+folds; the posterior mean is interpolated between adjacent bin centers. The
+rollout's reward is the resulting posterior correctness estimate when it
+matches an accepted pseudo-label, and zero otherwise. Question-level
+cross-fitting prevents a problem's own outcomes from calibrating its reward.
+This calibration uses labeled GSM8K training data and must not use test
+answers. At least two training problems are required.
+
+```bash
+python -m math_tta.cli grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-tta3-grpo \
+  --model Qwen/Qwen3-0.6B \
+  --reward-mode pseudo-label \
+  --sampling-policy tta-3 \
+  --samples 4 \
+  --max-samples 8 \
+  --tta1-threshold 0.8 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
+
 ### Offline confidence/reward check
 
-The rollout audit simulates TTA-2 rewards on the TTA-1 samples by default and
-reports confidence-versus-training-answer accuracy bins alongside reward and
-advantage distributions. This reuses the saved trajectories, so it checks the
-reward mechanics without another sampling run or model update:
+The rollout audit simulates TTA-2 and TTA-3 rewards on saved samples by
+default, reports confidence-versus-training-answer accuracy bins, Bayesian
+calibration Brier score, and reward/advantage distributions. By default TTA-3
+uses the TTA-2 rollouts if provided, otherwise the TTA-1 rollouts. Pass the
+actual TTA-3 artifact to check stored rewards and advantages against replay.
+This reuses saved trajectories, so it does not require another sampling run
+or model update:
 
 ```bash
 python -m math_tta.audit_rollouts \
   --problems data/gsm8k_train.jsonl \
   --fixed6-rollouts outputs/qwen3-fixed6-grpo/rollouts-round-01.jsonl \
   --tta1-rollouts outputs/qwen3-tta1-grpo/rollouts-round-01.jsonl \
+  --tta2-rollouts outputs/qwen3-tta2-grpo/rollouts-round-01.jsonl \
+  --tta3-rollouts outputs/qwen3-tta3-grpo/rollouts-round-01.jsonl \
   --initial-samples 4 \
   --fixed-min-consensus 0.5 \
   --tta1-threshold 0.8 \

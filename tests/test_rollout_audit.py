@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from math_tta.audit_rollouts import (
+    _bayesian_calibration_diagnostics,
     _confidence_correctness_diagnostics,
     audit_rollouts,
     main,
@@ -110,6 +111,65 @@ class RolloutAuditTests(unittest.TestCase):
             sum(bucket["count"] for bucket in confidence_report["bins"]),
             4,
         )
+
+    def test_tta3_audit_replays_bayesian_rewards_and_reports_calibration(self) -> None:
+        problems = [
+            Problem("q1", "question 1", "rationale #### 1"),
+            Problem("q2", "question 2", "rationale #### 2"),
+        ]
+        candidates = [
+            Candidate("q1", "question 1", r"\boxed{1}")
+            for _ in range(4)
+        ] + [
+            Candidate("q2", "question 2", r"\boxed{2}")
+            for _ in range(4)
+        ]
+        confidences = [0.2, 0.4, 0.6, 0.8] * 2
+        details, summaries = audit_rollouts(
+            problems,
+            candidates,
+            policy="tta-3",
+            confidence_weights=confidences,
+            stored_rewards=[None] * 8,
+            stored_advantages=[None] * 8,
+            initial_samples=4,
+        )
+
+        self.assertEqual(len(details), 2)
+        self.assertTrue(
+            all(
+                rollout["bayesian_correctness_probability"] is not None
+                for detail in details
+                for rollout in detail["rollouts"]
+            )
+        )
+        self.assertEqual(
+            _bayesian_calibration_diagnostics(details)["sample_count"],
+            8,
+        )
+        self.assertEqual(summaries[0]["accepted_groups"], 2)
+
+        stored_rewards = [
+            reward
+            for detail in details
+            for reward in detail["prefixes"][-1]["rewards"]
+        ]
+        stored_advantages = [
+            advantage
+            for detail in details
+            for advantage in detail["prefixes"][-1]["advantages"]
+        ]
+        _, replay_summaries = audit_rollouts(
+            problems,
+            candidates,
+            policy="tta-3",
+            confidence_weights=confidences,
+            stored_rewards=stored_rewards,
+            stored_advantages=stored_advantages,
+            initial_samples=4,
+        )
+        self.assertEqual(replay_summaries[0]["stored_reward_mismatches"], 0)
+        self.assertEqual(replay_summaries[0]["stored_advantage_mismatches"], 0)
 
     def test_audit_rejects_noncontiguous_rollout_groups(self) -> None:
         problems = [

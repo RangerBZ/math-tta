@@ -9,6 +9,8 @@ from math_tta.rl_training import (
     _partition_problems,
     _padded_old_logprob_rows,
     _assign_tta2_rewards,
+    _assign_tta3_rewards,
+    _bayesian_calibrated_confidence,
     assign_pseudo_label_rewards,
     group_relative_advantages,
     run_grpo_training,
@@ -270,6 +272,42 @@ class GrpoTests(unittest.TestCase):
         self.assertEqual(rewards, [0.3, 0.5, 0.4, 0.0, 0.6, 0.8])
         self.assertTrue(groups[0]["accepted"])
 
+    def test_tta3_uses_cross_fitted_bayesian_correctness_estimates(self) -> None:
+        group_ids = ["q1", "q1", "q2", "q2"]
+        confidences = [0.525] * 4
+        estimates = _bayesian_calibrated_confidence(
+            group_ids,
+            confidences,
+            [True, True, False, False],
+        )
+        self.assertEqual(estimates, [0.25, 0.25, 0.75, 0.75])
+
+        changed_own_labels = _bayesian_calibrated_confidence(
+            group_ids,
+            confidences,
+            [False, False, False, False],
+        )
+        self.assertEqual(changed_own_labels[:2], estimates[:2])
+        self.assertNotEqual(changed_own_labels[2:], estimates[2:])
+
+    def test_tta3_weights_only_accepted_pseudo_label_matches(self) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}")
+            for _ in range(5)
+        ] + [Candidate("q1", "question", r"\boxed{2}")]
+        rewards, groups = _assign_tta3_rewards(
+            candidates,
+            [0.2, 0.4, 0.6, 0.8, 0.7, 0.9],
+            [0.3, 0.5, 0.7, 0.9, 0.4, 0.8],
+            threshold=0.8,
+        )
+
+        self.assertEqual(rewards, [0.3, 0.5, 0.7, 0.9, 0.4, 0.0])
+        self.assertEqual(
+            groups[0]["reward_scheme"],
+            "pseudo_label_match_times_bayesian_correctness_posterior",
+        )
+
     def test_tta1_confidence_uses_normalized_mean_token_entropy(self) -> None:
         self.assertEqual(_token_self_certainty(0.0, 100), 1.0)
         self.assertAlmostEqual(
@@ -348,6 +386,16 @@ class GrpoTests(unittest.TestCase):
                 output_dir="unused",
                 sampling_policy="tta-2",
                 reward_mode="verifier",
+            )
+
+    def test_tta3_requires_multiple_labeled_problems_before_model_load(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least two problems"):
+            run_grpo_training(
+                [Problem("train-00001", "question", "42")],
+                model_id="unused",
+                output_dir="unused",
+                sampling_policy="tta-3",
+                reward_mode="pseudo-label",
             )
 
     def test_rejects_clip_epsilon_outside_open_unit_interval_before_model_load(

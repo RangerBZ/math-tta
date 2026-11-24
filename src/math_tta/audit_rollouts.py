@@ -18,13 +18,14 @@ from math_tta.data import (
     write_jsonl,
 )
 from math_tta.rl_training import (
+    _bayesian_calibrated_confidence,
     _tta1_group_decision,
     assign_pseudo_label_rewards,
     group_relative_advantages,
 )
 from math_tta.verification import normalize_reference_answer
 
-SamplingPolicy = Literal["fixed", "tta-1", "tta-2"]
+SamplingPolicy = Literal["fixed", "tta-1", "tta-2", "tta-3"]
 
 
 def _read_rollout_metadata(
@@ -90,7 +91,7 @@ def load_rollout_artifact(
             row,
             "token_self_certainty",
             path=path,
-            required=policy in {"tta-1", "tta-2"},
+            required=policy in {"tta-1", "tta-2", "tta-3"},
         )
         if confidence is not None and not 0.0 <= confidence <= 1.0:
             raise ValueError(f"{path}: token_self_certainty must be in [0, 1]")
@@ -142,6 +143,7 @@ def _prefix_state(
     policy: SamplingPolicy,
     fixed_min_consensus: float,
     tta1_threshold: float,
+    bayesian_confidence_weights: Sequence[float] | None = None,
 ) -> tuple[dict[str, Any], list[float], list[float]]:
     count_winner, consensus = _answer_vote(candidates)
     confidence_winner: str | None = None
@@ -211,6 +213,10 @@ def _prefix_state(
             reward = float(matches_pseudo_label)
             if policy == "tta-2":
                 reward *= complete_confidences[index]
+            elif policy == "tta-3":
+                if bayesian_confidence_weights is None:
+                    raise ValueError("TTA-3 requires Bayesian confidence estimates")
+                reward *= bayesian_confidence_weights[index]
             rewards.append(reward)
 
     advantages = group_relative_advantages(
@@ -305,8 +311,8 @@ def audit_rollouts(
     tta1_threshold: float = 0.8,
     sample_increment: int = 2,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if policy not in {"fixed", "tta-1", "tta-2"}:
-        raise ValueError("policy must be 'fixed', 'tta-1', or 'tta-2'")
+    if policy not in {"fixed", "tta-1", "tta-2", "tta-3"}:
+        raise ValueError("policy must be 'fixed', 'tta-1', 'tta-2', or 'tta-3'")
     if initial_samples < 1 or sample_increment < 1:
         raise ValueError("initial_samples and sample_increment must be positive")
     if not 0.0 < fixed_min_consensus <= 1.0:
@@ -322,6 +328,25 @@ def audit_rollouts(
         stored_advantages,
     )
     indices_by_id = _group_candidate_indices(candidates)
+    bayesian_confidences: list[float] | None = None
+    if policy == "tta-3":
+        complete_confidences = [
+            float(confidence)
+            for confidence in confidence_weights
+            if confidence is not None
+        ]
+        if len(complete_confidences) != len(candidates):
+            raise ValueError("TTA-3 requires confidence for every rollout")
+        correctness_by_index = [
+            normalize_answer(extract_answer(candidate.completion) or "")
+            == normalize_reference_answer(problem_by_id[candidate.id].answer or "")
+            for candidate in candidates
+        ]
+        bayesian_confidences = _bayesian_calibrated_confidence(
+            [candidate.id for candidate in candidates],
+            complete_confidences,
+            correctness_by_index,
+        )
     maximum_samples = max(map(len, indices_by_id.values()))
     if maximum_samples < initial_samples:
         raise ValueError("rollouts do not reach the configured initial sample count")
@@ -357,6 +382,11 @@ def audit_rollouts(
                     normalized_answers[sample_index - 1] == gold_answer
                 ),
                 "token_self_certainty": group_confidences[sample_index - 1],
+                "bayesian_correctness_probability": (
+                    bayesian_confidences[indices[sample_index - 1]]
+                    if bayesian_confidences is not None
+                    else None
+                ),
                 "stored_reward": stored_rewards[indices[sample_index - 1]],
                 "stored_advantage": stored_advantages[indices[sample_index - 1]],
             }
@@ -376,6 +406,14 @@ def audit_rollouts(
                 policy=policy,
                 fixed_min_consensus=fixed_min_consensus,
                 tta1_threshold=tta1_threshold,
+                bayesian_confidence_weights=(
+                    [
+                        bayesian_confidences[index]
+                        for index in indices[:sample_count]
+                    ]
+                    if bayesian_confidences is not None
+                    else None
+                ),
             )
             pseudo_answer = state["pseudo_answer"]
             state["pseudo_label_correct_vs_reference"] = (
@@ -709,11 +747,45 @@ def _confidence_correctness_diagnostics(
     }
 
 
+def _bayesian_calibration_diagnostics(
+    details: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    samples = [
+        rollout
+        for detail in details
+        for rollout in detail["rollouts"]
+        if rollout["bayesian_correctness_probability"] is not None
+    ]
+    if not samples:
+        return {"available": False}
+    return {
+        "available": True,
+        "sample_count": len(samples),
+        "mean_predicted_correctness": sum(
+            item["bayesian_correctness_probability"] for item in samples
+        )
+        / len(samples),
+        "observed_accuracy": sum(
+            item["correct_vs_reference"] for item in samples
+        )
+        / len(samples),
+        "brier_score": sum(
+            (
+                item["bayesian_correctness_probability"]
+                - float(item["correct_vs_reference"])
+            )
+            ** 2
+            for item in samples
+        )
+        / len(samples),
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m math_tta.audit_rollouts",
         description=(
-            "Compare fixed-6 and TTA-1 rollout correctness, pseudo-label "
+            "Compare fixed-6 and adaptive rollout correctness, pseudo-label "
             "stability, and recomputed GRPO reward/advantage distributions."
         ),
     )
@@ -733,6 +805,13 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "optional raw TTA-2 rollout JSONL; omit to simulate TTA-2 rewards "
             "on the TTA-1 rollouts"
+        ),
+    )
+    parser.add_argument(
+        "--tta3-rollouts",
+        help=(
+            "optional raw TTA-3 rollout JSONL; omit to simulate TTA-3 rewards "
+            "on TTA-2 rollouts, or TTA-1 rollouts when TTA-2 is omitted"
         ),
     )
     parser.add_argument("--initial-samples", type=int, default=4)
@@ -800,6 +879,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_details["tta2"] = tta2_details
         run_summaries["tta2"] = tta2_summaries
         run_id_sets["tta2"] = {str(record["id"]) for record in tta2_details}
+        tta3_path = (
+            arguments.tta3_rollouts
+            or arguments.tta2_rollouts
+            or arguments.tta1_rollouts
+        )
+        tta3_candidates, tta3_confidences, tta3_rewards, tta3_advantages = (
+            load_rollout_artifact(tta3_path, policy="tta-3")
+        )
+        if arguments.tta3_rollouts is None:
+            tta3_rewards = [None] * len(tta3_candidates)
+            tta3_advantages = [None] * len(tta3_candidates)
+        tta3_details, tta3_summaries = audit_rollouts(
+            problems,
+            tta3_candidates,
+            policy="tta-3",
+            confidence_weights=tta3_confidences,
+            stored_rewards=tta3_rewards,
+            stored_advantages=tta3_advantages,
+            initial_samples=arguments.initial_samples,
+            fixed_min_consensus=arguments.fixed_min_consensus,
+            tta1_threshold=arguments.tta1_threshold,
+            sample_increment=arguments.sample_increment,
+        )
+        run_details["tta3"] = tta3_details
+        run_summaries["tta3"] = tta3_summaries
+        run_id_sets["tta3"] = {str(record["id"]) for record in tta3_details}
         if run_id_sets["fixed6"] != run_id_sets["tta1"]:
             raise ValueError(
                 "fixed-6 and TTA-1 rollout files must contain the same problem IDs"
@@ -807,6 +912,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if run_id_sets["tta1"] != run_id_sets["tta2"]:
             raise ValueError(
                 "TTA-1 and TTA-2 rollout files must contain the same problem IDs"
+            )
+        if run_id_sets["tta2"] != run_id_sets["tta3"]:
+            raise ValueError(
+                "TTA-2 and TTA-3 rollout files must contain the same problem IDs"
             )
 
         output_dir = Path(arguments.output_dir)
@@ -826,6 +935,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_name: _confidence_correctness_diagnostics(details)
                 for run_name, details in run_details.items()
             },
+            "bayesian_reward_calibration": _bayesian_calibration_diagnostics(
+                run_details["tta3"]
+            ),
         }
         with (output_dir / "summary.json").open("w", encoding="utf-8") as target:
             json.dump(summary, target, ensure_ascii=False, indent=2)
