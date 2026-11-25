@@ -10,7 +10,11 @@ from math_tta.rl_training import (
     _padded_old_logprob_rows,
     _assign_tta2_rewards,
     _assign_tta3_rewards,
+    _assign_tta4_rewards,
     _bayesian_calibrated_confidence,
+    _cross_fitted_group_reliability,
+    _tta4_loss_weights,
+    _tta4_training_data,
     assign_pseudo_label_rewards,
     group_relative_advantages,
     run_grpo_training,
@@ -307,6 +311,116 @@ class GrpoTests(unittest.TestCase):
             groups[0]["reward_scheme"],
             "pseudo_label_match_times_bayesian_correctness_posterior",
         )
+
+    def test_tta4_cross_fits_group_reliability_by_question(self) -> None:
+        features = {
+            f"q{index}": (0.8 + index * 0.01, 0.7)
+            for index in range(6)
+        }
+        correctness = {
+            f"q{index}": index != 2
+            for index in range(6)
+        }
+
+        estimates = _cross_fitted_group_reliability(features, correctness)
+        changed_own_label = dict(correctness)
+        changed_own_label["q0"] = not changed_own_label["q0"]
+        estimates_after_label_change = _cross_fitted_group_reliability(
+            features,
+            changed_own_label,
+        )
+
+        self.assertEqual(estimates["q0"], estimates_after_label_change["q0"])
+        self.assertTrue(
+            all(0.0 < probability < 1.0 for probability in estimates.values())
+        )
+
+    def test_tta4_ranks_matching_confidence_and_records_group_weight(self) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{2}"),
+        ]
+
+        rewards, groups = _assign_tta4_rewards(
+            candidates,
+            [0.2, 0.4, 0.6, 0.8, 0.1],
+            {"q1": 0.9},
+            threshold=0.8,
+        )
+
+        for reward, expected in zip(
+            rewards,
+            [1.0, 4 / 3, 5 / 3, 2.0, 0.0],
+            strict=True,
+        ):
+            self.assertAlmostEqual(reward, expected)
+        self.assertTrue(groups[0]["accepted"])
+        self.assertEqual(groups[0]["group_reliability_probability"], 0.9)
+        self.assertEqual(
+            groups[0]["reward_scheme"],
+            "pseudo_label_confidence_rank_with_group_reliability",
+        )
+
+    def test_tta4_group_training_data_uses_winner_correctness(self) -> None:
+        candidates = [
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+            Candidate("q1", "question", r"\boxed{2}"),
+            Candidate("q1", "question", r"\boxed{1}"),
+        ]
+        groups = [
+            {"id": "q1", "count_winner": "1", "consensus": 0.75}
+        ]
+        verified = [
+            Mock(is_correct=True),
+            Mock(is_correct=True),
+            Mock(is_correct=False),
+            Mock(is_correct=True),
+        ]
+
+        features, labels = _tta4_training_data(
+            candidates,
+            [0.2, 0.4, 0.9, 0.8],
+            groups,
+            verified,
+        )
+
+        self.assertEqual(features["q1"], (0.75, (0.2 + 0.4 + 0.8) / 3))
+        self.assertEqual(labels, {"q1": True})
+
+    def test_tta4_loss_weights_sum_to_group_reliability(self) -> None:
+        weights = _tta4_loss_weights(
+            ["q1", "q1", "q2"],
+            [1.0, -1.0, 0.0],
+            {"q1": 0.8, "q2": 0.9},
+        )
+
+        self.assertEqual(weights, [0.4, 0.4, 1.0])
+
+    def test_tta4_requires_multiple_labeled_problems_before_model_load(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least two problems"):
+            run_grpo_training(
+                [Problem("train-00001", "question", "42")],
+                model_id="unused",
+                output_dir="unused",
+                sampling_policy="tta-4",
+                reward_mode="pseudo-label",
+            )
+
+        with self.assertRaisesRegex(ValueError, "reference answers"):
+            run_grpo_training(
+                [
+                    Problem("train-00001", "question 1", "42"),
+                    Problem("train-00002", "question 2"),
+                ],
+                model_id="unused",
+                output_dir="unused",
+                sampling_policy="tta-4",
+                reward_mode="pseudo-label",
+            )
 
     def test_tta1_confidence_uses_normalized_mean_token_entropy(self) -> None:
         self.assertEqual(_token_self_certainty(0.0, 100), 1.0)

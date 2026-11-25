@@ -368,6 +368,44 @@ python -m math_tta.cli grpo \
   --seed 42
 ```
 
+### TTA-4 cross-fitted group-reliability weighting
+
+TTA-4 keeps TTA-1's adaptive sampling and acceptance rule. On accepted
+training groups, it fits a small L2-regularized logistic model to predict
+whether the group's pseudo-answer is correct. Its inputs are answer
+consensus and mean confidence among winner rollouts. Predictions are
+cross-fitted by question so a question's own
+verifier result is excluded from its reliability estimate.
+
+Among rollouts matching an accepted pseudo-answer, TTA-4 ranks self-certainty
+within that group and uses the rank to create reward variation. The predicted
+group reliability weights the GRPO loss directly; it is not multiplied into
+the rewards, since a common per-group reward multiplier would be cancelled by
+group-relative advantage normalization. Dissenting and unaccepted rollouts
+receive zero reward. TTA-4 requires labeled training answers for calibration
+and does not use test answers.
+
+```bash
+python -m math_tta.cli grpo \
+  --input data/gsm8k_train.jsonl \
+  --output-dir outputs/qwen3-tta4-grpo \
+  --model Qwen/Qwen3-0.6B \
+  --reward-mode pseudo-label \
+  --sampling-policy tta-4 \
+  --samples 4 \
+  --max-samples 8 \
+  --tta1-threshold 0.8 \
+  --max-new-tokens 512 \
+  --rounds 1 \
+  --epochs 1 \
+  --batch-size 1 \
+  --max-length 2048 \
+  --learning-rate 1e-6 \
+  --clip-epsilon 0.2 \
+  --tune-mode lora \
+  --seed 42
+```
+
 ### Offline confidence/reward check
 
 The rollout audit simulates TTA-2 and TTA-3 rewards on saved samples by

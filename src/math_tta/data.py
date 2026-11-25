@@ -32,6 +32,7 @@ class Rollout:
     reward: float
     old_policy_logprobs: tuple[float, ...]
     advantage: float
+    group_weight: float = 1.0
 
 
 def _read_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:

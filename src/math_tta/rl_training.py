@@ -8,9 +8,9 @@ from copy import deepcopy
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from itertools import islice
-from math import isclose, isfinite, log, sqrt
+from math import exp, isclose, isfinite, log, sqrt
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from math_tta.answers import extract_answer, normalize_answer
 from math_tta.data import Candidate, Problem, Rollout, write_jsonl
@@ -24,9 +24,10 @@ from math_tta.progress import load_tqdm
 from math_tta.verification import verify_candidates, verification_metrics
 
 RewardMode = Literal["verifier", "pseudo-label"]
-SamplingPolicy = Literal["fixed", "tta-1", "tta-2", "tta-3"]
+SamplingPolicy = Literal["fixed", "tta-1", "tta-2", "tta-3", "tta-4"]
 _BAYESIAN_CONFIDENCE_BINS = 20
 _BAYESIAN_CALIBRATION_FOLDS = 5
+_TTA4_RELIABILITY_FOLDS = 5
 
 
 def _partition_problems(
@@ -283,6 +284,235 @@ def _assign_tta3_rewards(
         reward_weights=calibrated_confidences,
         reward_scheme="pseudo_label_match_times_bayesian_correctness_posterior",
     )
+
+
+def _cross_fitted_group_reliability(
+    group_features: Mapping[str, tuple[float, float]],
+    group_correctness: Mapping[str, bool],
+) -> dict[str, float]:
+    if set(group_features) != set(group_correctness):
+        raise ValueError("group features and correctness labels must have matching ids")
+    if len(group_features) < 2:
+        raise ValueError("TTA-4 requires at least two accepted labelled groups")
+    if any(len(features) != 2 for features in group_features.values()) or any(
+        not isfinite(value) or not 0.0 <= value <= 1.0
+        for features in group_features.values()
+        for value in features
+    ):
+        raise ValueError("TTA-4 group features must be finite values in [0, 1]")
+
+    problem_ids = sorted(group_features)
+    fold_count = min(_TTA4_RELIABILITY_FOLDS, len(problem_ids))
+    folds = {
+        problem_id: index % fold_count
+        for index, problem_id in enumerate(problem_ids)
+    }
+    estimates: dict[str, float] = {}
+    for fold in range(fold_count):
+        training_ids = [
+            problem_id for problem_id in problem_ids if folds[problem_id] != fold
+        ]
+        held_out_ids = [
+            problem_id for problem_id in problem_ids if folds[problem_id] == fold
+        ]
+        coefficients = _fit_group_reliability_model(
+            [group_features[problem_id] for problem_id in training_ids],
+            [group_correctness[problem_id] for problem_id in training_ids],
+        )
+        for problem_id in held_out_ids:
+            estimates[problem_id] = _sigmoid(
+                coefficients[0]
+                + sum(
+                    coefficient * value
+                    for coefficient, value in zip(
+                        coefficients[1:],
+                        group_features[problem_id],
+                        strict=True,
+                    )
+                )
+            )
+    return estimates
+
+
+def _fit_group_reliability_model(
+    features: Sequence[tuple[float, float]],
+    labels: Sequence[bool],
+) -> list[float]:
+    positive_count = sum(labels)
+    intercept = log((positive_count + 1) / (len(labels) - positive_count + 1))
+    coefficients = [intercept, 0.0, 0.0]
+    learning_rate = 0.2
+    regularization = 0.05
+    for _ in range(300):
+        gradients = [0.0] * len(coefficients)
+        for row, label in zip(features, labels, strict=True):
+            probability = _sigmoid(
+                coefficients[0]
+                + coefficients[1] * row[0]
+                + coefficients[2] * row[1]
+            )
+            error = probability - float(label)
+            gradients[0] += error
+            gradients[1] += error * row[0]
+            gradients[2] += error * row[1]
+        sample_count = len(labels)
+        gradients = [
+            gradient / sample_count
+            + (regularization * coefficients[index] if index else 0.0)
+            for index, gradient in enumerate(gradients)
+        ]
+        coefficients = [
+            coefficient - learning_rate * gradient
+            for coefficient, gradient in zip(coefficients, gradients, strict=True)
+        ]
+    return coefficients
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0:
+        return 1.0 / (1.0 + exp(-min(value, 40.0)))
+    exponential = exp(max(value, -40.0))
+    return exponential / (1.0 + exponential)
+
+
+def _tta4_training_data(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    accepted_groups: Sequence[dict[str, object]],
+    verified: Sequence[Any],
+) -> tuple[dict[str, tuple[float, float]], dict[str, bool]]:
+    if len(candidates) != len(confidence_weights):
+        raise ValueError("each candidate must have one confidence weight")
+    if len(candidates) != len(verified):
+        raise ValueError("each candidate must have one verifier result")
+    grouped_indices: dict[str, list[int]] = defaultdict(list)
+    for index, candidate in enumerate(candidates):
+        grouped_indices[candidate.id].append(index)
+
+    features: dict[str, tuple[float, float]] = {}
+    correctness: dict[str, bool] = {}
+    for record in accepted_groups:
+        problem_id = str(record["id"])
+        winner = record["count_winner"]
+        if not isinstance(winner, str):
+            raise RuntimeError("accepted TTA-4 group has no pseudo-label")
+        matching_indices = [
+            index
+            for index in grouped_indices[problem_id]
+            if (answer := extract_answer(candidates[index].completion)) is not None
+            and normalize_answer(answer) == winner
+        ]
+        match_labels = {verified[index].is_correct for index in matching_indices}
+        if not matching_indices or len(match_labels) != 1:
+            raise RuntimeError(
+                f"could not consistently verify TTA-4 pseudo-label for {problem_id!r}"
+            )
+        consensus = record["consensus"]
+        if isinstance(consensus, bool) or not isinstance(consensus, (int, float)):
+            raise RuntimeError("accepted TTA-4 group has invalid consensus")
+        features[problem_id] = (
+            float(consensus),
+            sum(confidence_weights[index] for index in matching_indices)
+            / len(matching_indices),
+        )
+        correctness[problem_id] = match_labels.pop()
+    return features, correctness
+
+
+def _assign_tta4_rewards(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    group_reliabilities: Mapping[str, float],
+    *,
+    threshold: float,
+) -> tuple[list[float], list[dict[str, object]]]:
+    if len(candidates) != len(confidence_weights):
+        raise ValueError("each candidate must have one confidence weight")
+    grouped_indices: dict[str, list[int]] = defaultdict(list)
+    for index, candidate in enumerate(candidates):
+        grouped_indices[candidate.id].append(index)
+
+    rank_weights = [0.0] * len(candidates)
+    for problem_id, indices in grouped_indices.items():
+        group_candidates = [candidates[index] for index in indices]
+        group_confidences = [confidence_weights[index] for index in indices]
+        decision = _tta1_group_decision(
+            group_candidates,
+            group_confidences,
+            threshold=threshold,
+        )
+        if not decision["accepted"]:
+            continue
+        reliability = group_reliabilities.get(problem_id)
+        if reliability is None or not isfinite(reliability) or not 0.0 <= reliability <= 1.0:
+            raise ValueError(
+                f"accepted TTA-4 group {problem_id!r} has no valid "
+                "cross-fitted reliability"
+            )
+        winner = decision["count_winner"]
+        matching_indices = [
+            index
+            for index in indices
+            if (answer := extract_answer(candidates[index].completion)) is not None
+            and normalize_answer(answer) == winner
+        ]
+        ordered = sorted(matching_indices, key=lambda index: confidence_weights[index])
+        start = 0
+        while start < len(ordered):
+            end = start + 1
+            while (
+                end < len(ordered)
+                and confidence_weights[ordered[end]]
+                == confidence_weights[ordered[start]]
+            ):
+                end += 1
+            rank = (
+                0.5
+                if len(ordered) == 1
+                else (start + end - 1) / (2 * (len(ordered) - 1))
+            )
+            for position in range(start, end):
+                rank_weights[ordered[position]] = 1.0 + rank
+            start = end
+
+    rewards, records = _assign_tta_rewards(
+        candidates,
+        confidence_weights,
+        threshold=threshold,
+        confidence_shaped=False,
+        reward_weights=rank_weights,
+        reward_scheme="pseudo_label_confidence_rank_with_group_reliability",
+    )
+    for record in records:
+        problem_id = str(record["id"])
+        reliability = (
+            group_reliabilities.get(problem_id)
+            if record["accepted"]
+            else None
+        )
+        record["group_reliability_probability"] = reliability
+        record.pop("calibrated_confidence_weights", None)
+    return rewards, records
+
+
+def _tta4_loss_weights(
+    group_ids: Sequence[str],
+    advantages: Sequence[float],
+    group_reliabilities: Mapping[str, float],
+) -> list[float]:
+    if len(group_ids) != len(advantages):
+        raise ValueError("group ids and advantages must have the same length")
+    trainable_counts = Counter(
+        group_id
+        for group_id, advantage in zip(group_ids, advantages, strict=True)
+        if advantage != 0.0
+    )
+    return [
+        group_reliabilities[group_id] / trainable_counts[group_id]
+        if advantage != 0.0 and group_id in group_reliabilities
+        else 1.0
+        for group_id, advantage in zip(group_ids, advantages, strict=True)
+    ]
 
 
 def _assign_tta_rewards(
@@ -800,6 +1030,11 @@ def _collate_rollouts(
         dtype=torch.float32,
         device=device,
     )
+    batch["group_weights"] = torch.tensor(
+        [rollout.group_weight for rollout in rollouts],
+        dtype=torch.float32,
+        device=device,
+    )
     return batch
 
 
@@ -910,9 +1145,13 @@ def _train_grpo_rollouts(
                 )
                 response_mask = batch["response_mask"]
                 token_counts = response_mask.sum(dim=1).clamp_min(1.0)
-                loss = -(
+                per_rollout_loss = -(
                     (surrogate * response_mask).sum(dim=1) / token_counts
-                ).mean()
+                )
+                group_weights = batch["group_weights"]
+                loss = (per_rollout_loss * group_weights).sum() / (
+                    group_weights.sum().clamp_min(1e-8)
+                )
 
             loss.backward()
             trainable_parameters = [
@@ -953,6 +1192,7 @@ def _rollout_record(
     pseudo_label_record: dict[str, object] | None = None,
     token_self_certainty: float | None = None,
     bayesian_correctness_probability: float | None = None,
+    group_reliability_probability: float | None = None,
 ) -> dict[str, object]:
     candidate = rollout.candidate
     record: dict[str, object] = {
@@ -972,6 +1212,8 @@ def _rollout_record(
         record["bayesian_correctness_probability"] = (
             bayesian_correctness_probability
         )
+    if group_reliability_probability is not None:
+        record["group_reliability_probability"] = group_reliability_probability
     if pseudo_label_record is not None:
         record.update(
             {
@@ -1025,23 +1267,32 @@ def run_grpo_training(
         )
     if reward_mode not in {"verifier", "pseudo-label"}:
         raise ValueError("reward_mode must be 'verifier' or 'pseudo-label'")
-    if sampling_policy not in {"fixed", "tta-1", "tta-2", "tta-3"}:
+    if sampling_policy not in {"fixed", "tta-1", "tta-2", "tta-3", "tta-4"}:
         raise ValueError(
-            "sampling_policy must be 'fixed', 'tta-1', 'tta-2', or 'tta-3'"
+            "sampling_policy must be 'fixed', 'tta-1', 'tta-2', 'tta-3', "
+            "or 'tta-4'"
         )
-    adaptive_sampling = sampling_policy in {"tta-1", "tta-2", "tta-3"}
+    adaptive_sampling = sampling_policy in {
+        "tta-1",
+        "tta-2",
+        "tta-3",
+        "tta-4",
+    }
     if adaptive_sampling and reward_mode != "pseudo-label":
         raise ValueError(
             f"sampling_policy={sampling_policy!r} requires pseudo-label rewards"
         )
-    if sampling_policy == "tta-3" and len(problems) < 2:
-        raise ValueError("sampling_policy='tta-3' requires at least two problems")
-    if sampling_policy == "tta-3" and any(
+    if sampling_policy in {"tta-3", "tta-4"} and len(problems) < 2:
+        raise ValueError(
+            f"sampling_policy={sampling_policy!r} requires at least two problems"
+        )
+    if sampling_policy in {"tta-3", "tta-4"} and any(
         problem.answer is None or not problem.answer.strip()
         for problem in problems
     ):
         raise ValueError(
-            "sampling_policy='tta-3' requires reference answers for calibration"
+            f"sampling_policy={sampling_policy!r} requires reference answers "
+            "for calibration"
         )
     if adaptive_sampling and max_samples < samples:
         raise ValueError("max_samples must be at least samples for adaptive policies")
@@ -1305,10 +1556,14 @@ def run_grpo_training(
             else None
         )
         bayesian_confidences: list[float] | None = None
+        group_reliabilities: dict[str, float] | None = None
+        group_loss_weights_by_id: dict[str, float] = {}
+        group_correctness: dict[str, bool] = {}
 
         verified = (
             verify_candidates(problems, candidates)
-            if reward_mode == "verifier" or sampling_policy == "tta-3"
+            if reward_mode == "verifier"
+            or sampling_policy in {"tta-3", "tta-4"}
             else None
         )
         if sampling_policy == "fixed":
@@ -1347,6 +1602,33 @@ def run_grpo_training(
                     bayesian_confidences,
                     threshold=tta1_threshold,
                 )
+            elif sampling_policy == "tta-4":
+                if verified is None:
+                    raise RuntimeError("TTA-4 did not verify calibration rollouts")
+                _, accepted_groups = _assign_tta1_rewards(
+                    candidates,
+                    token_self_certainties,
+                    threshold=tta1_threshold,
+                )
+                accepted_groups = [
+                    record for record in accepted_groups if record["accepted"]
+                ]
+                group_features, group_correctness = _tta4_training_data(
+                    candidates,
+                    token_self_certainties,
+                    accepted_groups,
+                    verified,
+                )
+                group_reliabilities = _cross_fitted_group_reliability(
+                    group_features,
+                    group_correctness,
+                )
+                rewards, pseudo_label_groups = _assign_tta4_rewards(
+                    candidates,
+                    token_self_certainties,
+                    group_reliabilities,
+                    threshold=tta1_threshold,
+                )
             else:
                 assign_rewards = (
                     _assign_tta2_rewards
@@ -1358,6 +1640,15 @@ def run_grpo_training(
                     token_self_certainties,
                     threshold=tta1_threshold,
                 )
+            group_reliability_brier_score: float | None = None
+            if group_reliabilities is not None and group_correctness:
+                group_reliability_brier_score = sum(
+                    (
+                        group_reliabilities[problem_id] - float(correct)
+                    )
+                    ** 2
+                    for problem_id, correct in group_correctness.items()
+                ) / len(group_correctness)
             metrics = {
                 **_pseudo_label_metrics(
                     candidates,
@@ -1401,9 +1692,15 @@ def run_grpo_training(
                     if bayesian_confidences is not None
                     else None
                 ),
+                "mean_group_reliability_probability": (
+                    sum(group_reliabilities.values()) / len(group_reliabilities)
+                    if group_reliabilities is not None and group_reliabilities
+                    else None
+                ),
+                "group_reliability_brier_score": group_reliability_brier_score,
                 "pseudo_label_reward_rate": (
                     sum(reward > 0.0 for reward in rewards) / len(rewards)
-                    if sampling_policy in {"tta-2", "tta-3"}
+                    if sampling_policy in {"tta-2", "tta-3", "tta-4"}
                     else sum(rewards) / len(rewards)
                 ),
             }
@@ -1419,18 +1716,28 @@ def run_grpo_training(
             [candidate.id for candidate in candidates],
             rewards,
         )
+        if group_reliabilities is not None:
+            group_loss_weights = _tta4_loss_weights(
+                [candidate.id for candidate in candidates],
+                advantages,
+                group_reliabilities,
+            )
+        else:
+            group_loss_weights = [1.0] * len(candidates)
         rollouts = [
             Rollout(
                 candidate=candidate,
                 reward=reward,
                 old_policy_logprobs=old_policy_logprobs,
                 advantage=advantage,
+                group_weight=group_loss_weight,
             )
-            for candidate, reward, old_policy_logprobs, advantage in zip(
+            for candidate, reward, old_policy_logprobs, advantage, group_loss_weight in zip(
                 candidates,
                 rewards,
                 old_logprobs,
                 advantages,
+                group_loss_weights,
                 strict=True,
             )
         ]
@@ -1481,6 +1788,14 @@ def run_grpo_training(
                     bayesian_correctness_probability=(
                         bayesian_confidences[index]
                         if bayesian_confidences is not None
+                        else None
+                    ),
+                    group_reliability_probability=(
+                        group_reliabilities[rollout.candidate.id]
+                        if (
+                            group_reliabilities is not None
+                            and rollout.candidate.id in group_reliabilities
+                        )
                         else None
                     ),
                 )

@@ -135,11 +135,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     grpo.add_argument(
         "--sampling-policy",
-        choices=("fixed", "tta-1", "tta-2", "tta-3"),
+        choices=("fixed", "tta-1", "tta-2", "tta-3", "tta-4"),
         default="fixed",
         help=(
             "fixed rollouts, TTA-1 adaptive sampling, TTA-2 confidence rewards, "
-            "or TTA-3 Bayesian-calibrated confidence rewards"
+            "TTA-3 Bayesian-calibrated rewards, or TTA-4 cross-fitted "
+            "group-reliability weighting"
         ),
     )
     grpo.add_argument(
