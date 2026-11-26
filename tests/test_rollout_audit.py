@@ -8,11 +8,12 @@ import unittest
 from math_tta.audit_rollouts import (
     _bayesian_calibration_diagnostics,
     _confidence_correctness_diagnostics,
+    _tta4_group_reliability_diagnostics,
     audit_rollouts,
     main,
 )
 from math_tta.data import Candidate, Problem, write_jsonl
-from math_tta.rl_training import group_relative_advantages
+from math_tta.rl_training import _assign_tta4_rewards, group_relative_advantages
 
 
 class RolloutAuditTests(unittest.TestCase):
@@ -171,6 +172,51 @@ class RolloutAuditTests(unittest.TestCase):
         self.assertEqual(replay_summaries[0]["stored_reward_mismatches"], 0)
         self.assertEqual(replay_summaries[0]["stored_advantage_mismatches"], 0)
 
+    def test_tta4_audit_replays_rank_rewards_and_reports_reliability(self) -> None:
+        problems = [
+            Problem("q1", "question 1", "rationale #### 1"),
+            Problem("q2", "question 2", "rationale #### 2"),
+        ]
+        candidates = [
+            Candidate("q1", "question 1", r"\boxed{1}")
+            for _ in range(4)
+        ] + [
+            Candidate("q2", "question 2", r"\boxed{2}")
+            for _ in range(4)
+        ]
+        confidences = [0.2, 0.4, 0.6, 0.8] * 2
+
+        details, summaries = audit_rollouts(
+            problems,
+            candidates,
+            policy="tta-4",
+            confidence_weights=confidences,
+            stored_rewards=[None] * 8,
+            stored_advantages=[None] * 8,
+            initial_samples=4,
+        )
+
+        prefix = details[0]["prefixes"][-1]
+        expected = [1.0, 1.0 + 1 / 3, 1.0 + 2 / 3, 2.0]
+        for actual, value in zip(prefix["rewards"], expected, strict=True):
+            self.assertAlmostEqual(actual, value)
+
+        training_rewards, _ = _assign_tta4_rewards(
+            candidates[:4],
+            confidences[:4],
+            {"q1": 0.9},
+            threshold=0.8,
+        )
+        self.assertEqual(prefix["rewards"], training_rewards)
+
+        self.assertIsNotNone(details[0]["group_reliability_probability"])
+        report = _tta4_group_reliability_diagnostics(details)
+        self.assertTrue(report["available"])
+        self.assertEqual(report["sample_count"], 2)
+        self.assertEqual(report["observed_accuracy"], 1.0)
+        self.assertEqual(summaries[0]["mixed_reward_groups"], 2)
+        self.assertEqual(summaries[0]["nonzero_advantage_rollouts"], 8)
+
     def test_audit_rejects_noncontiguous_rollout_groups(self) -> None:
         problems = [
             Problem("q1", "question 1", "#### 1"),
@@ -199,6 +245,7 @@ class RolloutAuditTests(unittest.TestCase):
             problems_path = root / "problems.jsonl"
             fixed_path = root / "fixed6.jsonl"
             tta1_path = root / "tta1.jsonl"
+            tta4_path = root / "tta4.jsonl"
             output_dir = root / "audit"
 
             write_jsonl(
@@ -234,6 +281,19 @@ class RolloutAuditTests(unittest.TestCase):
                 ),
             )
 
+            write_jsonl(
+                tta4_path,
+                (
+                    {
+                        "id": "q1",
+                        "question": "question",
+                        "completion": r"\boxed{1}",
+                        "token_self_certainty": confidence,
+                    }
+                    for confidence in (0.2, 0.4, 0.6, 0.8)
+                ),
+            )
+
             with redirect_stdout(StringIO()):
                 result = main(
                     [
@@ -243,6 +303,8 @@ class RolloutAuditTests(unittest.TestCase):
                         str(fixed_path),
                         "--tta1-rollouts",
                         str(tta1_path),
+                        "--tta4-rollouts",
+                        str(tta4_path),
                         "--output-dir",
                         str(output_dir),
                     ]
@@ -257,6 +319,17 @@ class RolloutAuditTests(unittest.TestCase):
             self.assertEqual(
                 summary["confidence_correctness"]["tta2"]["sample_count"],
                 4,
+            )
+            self.assertEqual(
+                summary["runs"]["tta4"][0]["mixed_reward_groups"],
+                1,
+            )
+            self.assertEqual(
+                summary["runs"]["tta4"][0]["stored_reward_mismatches"],
+                0,
+            )
+            self.assertFalse(
+                summary["tta4_group_reliability"]["available"],
             )
 
 

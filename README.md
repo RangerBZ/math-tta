@@ -6,10 +6,9 @@ their extracted answers against labeled references, and fine-tune on accepted
 traces using LoRA.
 
 > **Scope note:** The prototype includes fixed-sample rejection-SFT, clipped
-> GRPO with verifier or majority pseudo-label rewards, and the TTA-1 adaptive
-> sampling policy described below. It does not implement adaptive trace
-> weighting or step-level verification; answer verification checks only the
-> final answer.
+> GRPO with verifier or majority pseudo-label rewards, and the TTA-1 to TTA-4
+> adaptive sampling and reward policies described below. It does not implement
+> step-level verification; answer verification checks only the final answer.
 
 ## Environment setup
 
@@ -408,13 +407,14 @@ python -m math_tta.cli grpo \
 
 ### Offline confidence/reward check
 
-The rollout audit simulates TTA-2 and TTA-3 rewards on saved samples by
+The rollout audit simulates TTA-2, TTA-3 and TTA-4 rewards on saved samples by
 default, reports confidence-versus-training-answer accuracy bins, Bayesian
-calibration Brier score, and reward/advantage distributions. By default TTA-3
-uses the TTA-2 rollouts if provided, otherwise the TTA-1 rollouts. Pass the
-actual TTA-3 artifact to check stored rewards and advantages against replay.
-This reuses saved trajectories, so it does not require another sampling run
-or model update:
+calibration Brier score, TTA-4 group-reliability Brier score, and
+reward/advantage distributions. By default TTA-3 uses the TTA-2 rollouts if
+provided, otherwise the TTA-1 rollouts; TTA-4 similarly falls back to TTA-3,
+TTA-2 or TTA-1. Pass the actual TTA-3/TTA-4 artifact to check stored rewards
+and advantages against replay. This reuses saved trajectories, so it does not
+require another sampling run or model update:
 
 ```bash
 python -m math_tta.audit_rollouts \
@@ -423,11 +423,19 @@ python -m math_tta.audit_rollouts \
   --tta1-rollouts outputs/qwen3-tta1-grpo/rollouts-round-01.jsonl \
   --tta2-rollouts outputs/qwen3-tta2-grpo/rollouts-round-01.jsonl \
   --tta3-rollouts outputs/qwen3-tta3-grpo/rollouts-round-01.jsonl \
+  --tta4-rollouts outputs/qwen3-tta4-grpo/rollouts-round-01.jsonl \
   --initial-samples 4 \
   --fixed-min-consensus 0.5 \
   --tta1-threshold 0.8 \
   --output-dir outputs/rollout-audit
 ```
+
+TTA-4 rewards depend only on answer agreement and within-group
+self-certainty rank, so they can be replayed from any adaptive rollout file.
+The TTA-4 group-reliability estimate is refitted on the audited training pool
+with the same question-level cross-fitting as training, and its calibration
+is reported under `tta4_group_reliability` in `summary.json`. It is marked
+unavailable when fewer than two accepted groups are present.
 
 Optionally pass `--tta2-rollouts` with the actual TTA-2 rollout artifact to
 check that recomputed TTA-2 rewards and advantages match the saved values.

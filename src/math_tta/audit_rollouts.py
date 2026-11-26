@@ -19,13 +19,14 @@ from math_tta.data import (
 )
 from math_tta.rl_training import (
     _bayesian_calibrated_confidence,
+    _cross_fitted_group_reliability,
     _tta1_group_decision,
     assign_pseudo_label_rewards,
     group_relative_advantages,
 )
 from math_tta.verification import normalize_reference_answer
 
-SamplingPolicy = Literal["fixed", "tta-1", "tta-2", "tta-3"]
+SamplingPolicy = Literal["fixed", "tta-1", "tta-2", "tta-3", "tta-4"]
 
 
 def _read_rollout_metadata(
@@ -91,7 +92,7 @@ def load_rollout_artifact(
             row,
             "token_self_certainty",
             path=path,
-            required=policy in {"tta-1", "tta-2", "tta-3"},
+            required=policy in {"tta-1", "tta-2", "tta-3", "tta-4"},
         )
         if confidence is not None and not 0.0 <= confidence <= 1.0:
             raise ValueError(f"{path}: token_self_certainty must be in [0, 1]")
@@ -136,6 +137,107 @@ def _label_transition(
     return "changed"
 
 
+def _tta4_rank_rewards(
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float],
+    *,
+    accepted: bool,
+    winner: str | None,
+) -> list[float]:
+    """Replay TTA-4 rewards: 1 + within-group confidence rank for matches."""
+    rewards = [0.0] * len(candidates)
+    if not accepted or winner is None:
+        return rewards
+    matching = [
+        index
+        for index, candidate in enumerate(candidates)
+        if (answer := extract_answer(candidate.completion)) is not None
+        and normalize_answer(answer) == winner
+    ]
+    ordered = sorted(matching, key=lambda index: confidence_weights[index])
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        while (
+            end < len(ordered)
+            and confidence_weights[ordered[end]] == confidence_weights[ordered[start]]
+        ):
+            end += 1
+        rank = (
+            0.5
+            if len(ordered) == 1
+            else (start + end - 1) / (2 * (len(ordered) - 1))
+        )
+        for position in range(start, end):
+            rewards[ordered[position]] = 1.0 + rank
+        start = end
+    return rewards
+
+
+def _group_reliability_estimates(
+    problem_by_id: dict[str, Problem],
+    candidates: Sequence[Candidate],
+    confidence_weights: Sequence[float | None],
+    indices_by_id: dict[str, list[int]],
+    *,
+    tta1_threshold: float,
+) -> dict[str, float]:
+    """Cross-fit TTA-4 group reliability on the audited rollout pool."""
+    features: dict[str, tuple[float, float]] = {}
+    labels: dict[str, bool] = {}
+    confidence_by_index: dict[int, float] = {}
+    for index, weight in enumerate(confidence_weights):
+        if weight is None:
+            raise ValueError("TTA-4 requires confidence for every rollout")
+        confidence_by_index[index] = weight
+    for problem_id, indices in indices_by_id.items():
+        group_candidates = [candidates[index] for index in indices]
+        group_confidences = [confidence_by_index[index] for index in indices]
+        decision = _tta1_group_decision(
+            group_candidates,
+            group_confidences,
+            threshold=tta1_threshold,
+        )
+        if not decision["accepted"]:
+            continue
+        winner = decision["count_winner"]
+        if not isinstance(winner, str):
+            raise RuntimeError("TTA-4 accepted group has no pseudo-label")
+        matching = [
+            index
+            for index in indices
+            if (answer := extract_answer(candidates[index].completion)) is not None
+            and normalize_answer(answer) == winner
+        ]
+        if not matching:
+            raise RuntimeError("TTA-4 accepted group has no matching rollout")
+        gold_answer = normalize_reference_answer(
+            problem_by_id[problem_id].answer or ""
+        )
+        matching_labels = {
+            normalize_answer(
+                extract_answer(candidates[index].completion) or ""
+            )
+            == gold_answer
+            for index in matching
+        }
+        if len(matching_labels) != 1:
+            raise ValueError(
+                f"TTA-4 pseudo-label for {problem_id!r} is not consistently correct"
+            )
+        consensus = decision["consensus"]
+        if isinstance(consensus, bool) or not isinstance(consensus, (int, float)):
+            raise RuntimeError("TTA-4 accepted group has invalid consensus")
+        features[problem_id] = (
+            float(consensus),
+            sum(confidence_by_index[index] for index in matching) / len(matching),
+        )
+        labels[problem_id] = matching_labels.pop()
+    if len(features) < 2:
+        return {}
+    return _cross_fitted_group_reliability(features, labels)
+
+
 def _prefix_state(
     candidates: Sequence[Candidate],
     confidence_weights: Sequence[float | None],
@@ -144,6 +246,7 @@ def _prefix_state(
     fixed_min_consensus: float,
     tta1_threshold: float,
     bayesian_confidence_weights: Sequence[float] | None = None,
+    tta4_reliability: float | None = None,
 ) -> tuple[dict[str, Any], list[float], list[float]]:
     count_winner, consensus = _answer_vote(candidates)
     confidence_winner: str | None = None
@@ -202,22 +305,32 @@ def _prefix_state(
         accepted = bool(decision["accepted"])
         decision_reason = str(decision["decision_reason"])
         pseudo_answer = count_winner if accepted else None
-        rewards = []
-        for index, candidate in enumerate(candidates):
-            answer = extract_answer(candidate.completion)
-            matches_pseudo_label = (
-                accepted
-                and answer is not None
-                and normalize_answer(answer) == count_winner
+        if policy == "tta-4":
+            rewards = _tta4_rank_rewards(
+                candidates,
+                complete_confidences,
+                accepted=accepted,
+                winner=count_winner,
             )
-            reward = float(matches_pseudo_label)
-            if policy == "tta-2":
-                reward *= complete_confidences[index]
-            elif policy == "tta-3":
-                if bayesian_confidence_weights is None:
-                    raise ValueError("TTA-3 requires Bayesian confidence estimates")
-                reward *= bayesian_confidence_weights[index]
-            rewards.append(reward)
+        else:
+            rewards = []
+            for index, candidate in enumerate(candidates):
+                answer = extract_answer(candidate.completion)
+                matches_pseudo_label = (
+                    accepted
+                    and answer is not None
+                    and normalize_answer(answer) == count_winner
+                )
+                reward = float(matches_pseudo_label)
+                if policy == "tta-2":
+                    reward *= complete_confidences[index]
+                elif policy == "tta-3":
+                    if bayesian_confidence_weights is None:
+                        raise ValueError(
+                            "TTA-3 requires Bayesian confidence estimates"
+                        )
+                    reward *= bayesian_confidence_weights[index]
+                rewards.append(reward)
 
     advantages = group_relative_advantages(
         [candidate.id for candidate in candidates],
@@ -239,6 +352,7 @@ def _prefix_state(
             "reward_positive_count": sum(reward > 0.0 for reward in rewards),
             "mean_reward": sum(rewards) / len(rewards),
             "mixed_rewards": min(rewards) != max(rewards),
+            "group_reliability_probability": tta4_reliability,
             "advantage_zero_count": sum(value == 0.0 for value in advantages),
             "advantage_negative_count": sum(value < 0.0 for value in advantages),
             "advantage_positive_count": sum(value > 0.0 for value in advantages),
@@ -311,8 +425,10 @@ def audit_rollouts(
     tta1_threshold: float = 0.8,
     sample_increment: int = 2,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if policy not in {"fixed", "tta-1", "tta-2", "tta-3"}:
-        raise ValueError("policy must be 'fixed', 'tta-1', 'tta-2', or 'tta-3'")
+    if policy not in {"fixed", "tta-1", "tta-2", "tta-3", "tta-4"}:
+        raise ValueError(
+            "policy must be 'fixed', 'tta-1', 'tta-2', 'tta-3', or 'tta-4'"
+        )
     if initial_samples < 1 or sample_increment < 1:
         raise ValueError("initial_samples and sample_increment must be positive")
     if not 0.0 < fixed_min_consensus <= 1.0:
@@ -346,6 +462,15 @@ def audit_rollouts(
             [candidate.id for candidate in candidates],
             complete_confidences,
             correctness_by_index,
+        )
+    tta4_reliabilities: dict[str, float] = {}
+    if policy == "tta-4":
+        tta4_reliabilities = _group_reliability_estimates(
+            problem_by_id,
+            candidates,
+            confidence_weights,
+            indices_by_id,
+            tta1_threshold=tta1_threshold,
         )
     maximum_samples = max(map(len, indices_by_id.values()))
     if maximum_samples < initial_samples:
@@ -414,6 +539,7 @@ def audit_rollouts(
                     if bayesian_confidences is not None
                     else None
                 ),
+                tta4_reliability=tta4_reliabilities.get(problem_id),
             )
             pseudo_answer = state["pseudo_answer"]
             state["pseudo_label_correct_vs_reference"] = (
@@ -500,6 +626,7 @@ def audit_rollouts(
                 "gold_final_answer": gold_answer,
                 "rollouts": rollout_records,
                 "prefixes": prefix_states,
+                "group_reliability_probability": tta4_reliabilities.get(problem_id),
             }
         )
 
@@ -781,6 +908,46 @@ def _bayesian_calibration_diagnostics(
     }
 
 
+def _tta4_group_reliability_diagnostics(
+    details: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    samples = []
+    for detail in details:
+        reliability = detail.get("group_reliability_probability")
+        if reliability is None:
+            continue
+        final_states = [
+            state for state in detail["prefixes"] if state["is_final_prefix"]
+        ]
+        if not final_states:
+            continue
+        final_state = final_states[-1]
+        if not final_state["accepted"]:
+            continue
+        samples.append(
+            (
+                float(reliability),
+                bool(final_state["pseudo_label_correct_vs_reference"]),
+            )
+        )
+    if not samples:
+        return {"available": False}
+    return {
+        "available": True,
+        "sample_count": len(samples),
+        "mean_predicted_correctness": sum(
+            reliability for reliability, _ in samples
+        )
+        / len(samples),
+        "observed_accuracy": sum(correct for _, correct in samples) / len(samples),
+        "brier_score": sum(
+            (reliability - float(correct)) ** 2
+            for reliability, correct in samples
+        )
+        / len(samples),
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m math_tta.audit_rollouts",
@@ -812,6 +979,14 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "optional raw TTA-3 rollout JSONL; omit to simulate TTA-3 rewards "
             "on TTA-2 rollouts, or TTA-1 rollouts when TTA-2 is omitted"
+        ),
+    )
+    parser.add_argument(
+        "--tta4-rollouts",
+        help=(
+            "optional raw TTA-4 rollout JSONL; omit to simulate TTA-4 rewards "
+            "on TTA-3 rollouts, or TTA-2/TTA-1 rollouts when earlier files "
+            "are omitted"
         ),
     )
     parser.add_argument("--initial-samples", type=int, default=4)
@@ -905,6 +1080,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_details["tta3"] = tta3_details
         run_summaries["tta3"] = tta3_summaries
         run_id_sets["tta3"] = {str(record["id"]) for record in tta3_details}
+        tta4_path = (
+            arguments.tta4_rollouts
+            or arguments.tta3_rollouts
+            or arguments.tta2_rollouts
+            or arguments.tta1_rollouts
+        )
+        tta4_candidates, tta4_confidences, tta4_rewards, tta4_advantages = (
+            load_rollout_artifact(tta4_path, policy="tta-4")
+        )
+        if arguments.tta4_rollouts is None:
+            tta4_rewards = [None] * len(tta4_candidates)
+            tta4_advantages = [None] * len(tta4_candidates)
+        tta4_details, tta4_summaries = audit_rollouts(
+            problems,
+            tta4_candidates,
+            policy="tta-4",
+            confidence_weights=tta4_confidences,
+            stored_rewards=tta4_rewards,
+            stored_advantages=tta4_advantages,
+            initial_samples=arguments.initial_samples,
+            fixed_min_consensus=arguments.fixed_min_consensus,
+            tta1_threshold=arguments.tta1_threshold,
+            sample_increment=arguments.sample_increment,
+        )
+        run_details["tta4"] = tta4_details
+        run_summaries["tta4"] = tta4_summaries
+        run_id_sets["tta4"] = {str(record["id"]) for record in tta4_details}
         if run_id_sets["fixed6"] != run_id_sets["tta1"]:
             raise ValueError(
                 "fixed-6 and TTA-1 rollout files must contain the same problem IDs"
@@ -916,6 +1118,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if run_id_sets["tta2"] != run_id_sets["tta3"]:
             raise ValueError(
                 "TTA-2 and TTA-3 rollout files must contain the same problem IDs"
+            )
+        if run_id_sets["tta3"] != run_id_sets["tta4"]:
+            raise ValueError(
+                "TTA-3 and TTA-4 rollout files must contain the same problem IDs"
             )
 
         output_dir = Path(arguments.output_dir)
@@ -937,6 +1143,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             "bayesian_reward_calibration": _bayesian_calibration_diagnostics(
                 run_details["tta3"]
+            ),
+            "tta4_group_reliability": _tta4_group_reliability_diagnostics(
+                run_details["tta4"]
             ),
         }
         with (output_dir / "summary.json").open("w", encoding="utf-8") as target:
