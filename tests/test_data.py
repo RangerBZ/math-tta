@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from math_tta.data import load_candidates
+from math_tta.data import load_candidates, prepare_svamp
 
 
 class DataTests(unittest.TestCase):
@@ -85,6 +85,44 @@ class DataTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "list of integers"):
                 load_candidates(path)
+
+
+    def test_prepare_svamp_converts_body_question_and_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "SVAMP.json"
+            output = Path(directory) / "svamp.jsonl"
+            source.write_text(
+                json.dumps(
+                    [
+                        {
+                            "Body": "A box has 3 pens.",
+                            "Question": "How many pens are there?",
+                            "Answer": 3,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(prepare_svamp(source, output), 1)
+            row = json.loads(output.read_text(encoding="utf-8").strip())
+            self.assertEqual(row["id"], "svamp-00000")
+            self.assertEqual(
+                row["question"], "A box has 3 pens. How many pens are there?"
+            )
+            self.assertEqual(row["answer"], "3")
+
+    def test_prepare_svamp_rejects_malformed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "SVAMP.json"
+            output = Path(directory) / "svamp.jsonl"
+            source.write_text(
+                json.dumps([{"Body": "missing question", "Answer": 1}]),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Body, Question, and Answer"):
+                prepare_svamp(source, output)
 
 
 if __name__ == "__main__":

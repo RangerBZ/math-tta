@@ -187,3 +187,28 @@ def prepare_gsm8k(split: str, output_path: str | Path) -> int:
 
     write_jsonl(output_path, counted_records())
     return count
+
+
+def prepare_svamp(input_path: str | Path, output_path: str | Path) -> int:
+    """Convert the SVAMP JSON file into labelled problem JSONL."""
+    rows = json.loads(Path(input_path).read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError("SVAMP input must be a JSON list of objects")
+    records = []
+    for index, row in enumerate(rows):
+        try:
+            question = f"{row['Body']} {row['Question']}".strip()
+            answer = str(row["Answer"])
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"SVAMP row {index} must contain Body, Question, and Answer"
+            ) from error
+        records.append(
+            {
+                "id": f"svamp-{index:05d}",
+                "question": question,
+                "answer": answer,
+            }
+        )
+    write_jsonl(output_path, records)
+    return len(records)

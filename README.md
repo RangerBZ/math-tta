@@ -103,6 +103,21 @@ final reference is extracted from its `####` marker. GSM8K has 7,473 training
 questions and 1,319 held-out test questions. The test split can be exported for
 final evaluation, but **must not** be passed to `train`.
 
+## Prepare SVAMP for transfer evaluation
+
+Download `SVAMP.json` from the [SVAMP repository](https://github.com/arkilpatel/SVAMP)
+and convert it to the same problem JSONL format:
+
+```bash
+math-tta prepare-svamp --input SVAMP.json --output data/svamp_test.jsonl
+```
+
+The converter joins the `Body` and `Question` fields and stores the numeric
+`Answer` as the reference answer, so the existing `generate` and `evaluate`
+commands work unchanged. SVAMP has 1,000 test problems and can be used to check
+whether GSM8K post-training transfers; it is not used for training in this
+project.
+
 ## Run verified self-training
 
 Start with a small pilot to verify model loading, answer extraction, and

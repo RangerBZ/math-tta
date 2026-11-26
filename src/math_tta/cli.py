@@ -11,6 +11,7 @@ from math_tta.data import (
     load_candidates,
     load_problems,
     prepare_gsm8k,
+    prepare_svamp,
     write_jsonl,
 )
 from math_tta.generation import generate_candidates
@@ -52,6 +53,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--split", choices=("train", "test"), default="train")
     prepare.add_argument("--output", required=True, help="output problem JSONL")
+
+    prepare_svamp_parser = commands.add_parser(
+        "prepare-svamp",
+        help="convert the SVAMP JSON file to problem JSONL",
+    )
+    prepare_svamp_parser.add_argument(
+        "--input",
+        required=True,
+        help="SVAMP.json",
+    )
+    prepare_svamp_parser.add_argument(
+        "--output",
+        required=True,
+        help="output problem JSONL",
+    )
 
     score = commands.add_parser(
         "score",
@@ -268,6 +284,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "prepare-gsm8k":
             count = prepare_gsm8k(arguments.split, arguments.output)
             print(f"Wrote {count} {arguments.split} problems -> {arguments.output}")
+            return 0
+
+        if arguments.command == "prepare-svamp":
+            count = prepare_svamp(arguments.input, arguments.output)
+            print(f"Wrote {count} SVAMP problems -> {arguments.output}")
             return 0
 
         if arguments.command == "score":
